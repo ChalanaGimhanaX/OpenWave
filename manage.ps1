@@ -45,6 +45,7 @@ function Parse-VlessUri {
         $hostPort = $rest
         $queryStr = ""
     }
+    $hostPort = $hostPort.TrimEnd('/')
 
     $addr = $null
     $port = "443"

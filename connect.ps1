@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    OpenWave - One-click V2Ray/VLESS tunnel for restricted networks.
+    OpenWave - One-click Xray/VLESS tunnel for restricted networks.
 .DESCRIPTION
     Run with:  irm https://your-host.com/connect.ps1 | iex
     Or locally: .\connect.ps1
@@ -25,11 +25,11 @@ $Banner = @"
 "@
 
 # ── Config ───────────────────────────────────────────────────────────────────
-$V2RayVersion   = "5.22.0"
-$V2RayZipUrl    = "https://github.com/v2fly/v2ray-core/releases/download/v$V2RayVersion/v2ray-windows-64.zip"
+$XrayVersion    = "25.5.16"
+$XrayZipUrl     = "https://github.com/XTLS/Xray-core/releases/download/v$XrayVersion/Xray-windows-64.zip"
 $InstallDir     = "$env:USERPROFILE\.openwave"
-$V2RayDir       = "$InstallDir\v2ray"
-$V2RayExe       = "$V2RayDir\v2ray.exe"
+$XrayDir        = "$InstallDir\xray"
+$XrayExe        = "$XrayDir\xray.exe"
 $ConfigPath     = "$InstallDir\config.json"
 $LocalSocksPort = 10808
 $LocalHttpPort  = 10809
@@ -110,6 +110,8 @@ function Parse-VlessUri {
         $hostPort = $rest
         $queryStr = ""
     }
+    # Strip trailing slash (some clients add /path before ?)
+    $hostPort = $hostPort.TrimEnd('/')
 
     # Parse host and port (handle IPv6)
     $addr = $null
@@ -164,7 +166,7 @@ function Parse-VlessUri {
 }
 
 # ── Config Generator ────────────────────────────────────────────────────────
-function Generate-V2RayConfig {
+function Generate-XrayConfig {
     param([hashtable]$Server)
 
     # Build stream settings based on transport type
@@ -218,7 +220,9 @@ function Generate-V2RayConfig {
                 fingerprint = $Server.Fingerprint
             }
             if ($Server.ALPN -ne "") {
-                $tlsSettings["alpn"] = @($Server.ALPN -split ',')
+                $alpnValues = @()
+                foreach ($a in ($Server.ALPN -split ',')) { $alpnValues += $a.Trim() }
+                $tlsSettings["alpn"] = $alpnValues
             }
             $streamSettings["tlsSettings"] = $tlsSettings
         }
@@ -243,7 +247,7 @@ function Generate-V2RayConfig {
         encryption = $Server.Encryption
         level      = 0
     }
-    if ($Server.Flow -ne "") {
+    if ($Server.Flow -ne "" -and $Server.Flow -ne "none") {
         $vlessUser["flow"] = $Server.Flow
     }
 
@@ -367,47 +371,47 @@ function Disable-SystemProxy {
     }
 }
 
-# ── Download & Extract V2Ray ────────────────────────────────────────────────
-function Install-V2Ray {
-    if (Test-Path $V2RayExe) {
-        Write-Ok "V2Ray already installed at $V2RayDir"
+# ── Download & Extract Xray ─────────────────────────────────────────────────
+function Install-Xray {
+    if (Test-Path $XrayExe) {
+        Write-Ok "Xray already installed at $XrayDir"
         return $true
     }
 
-    Write-Step ">>>" "Downloading V2Ray v$V2RayVersion..."
+    Write-Step ">>>" "Downloading Xray v$XrayVersion..."
 
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-    $zipPath = "$InstallDir\v2ray.zip"
+    $zipPath = "$InstallDir\xray.zip"
 
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         $ProgressPreference = 'SilentlyContinue'
-        Invoke-WebRequest -Uri $V2RayZipUrl -OutFile $zipPath -UseBasicParsing
+        Invoke-WebRequest -Uri $XrayZipUrl -OutFile $zipPath -UseBasicParsing
         $ProgressPreference = 'Continue'
     } catch {
-        Write-Err "Failed to download V2Ray: $_"
+        Write-Err "Failed to download Xray: $_"
         Write-C ""
-        Write-C "  If GitHub is blocked, manually download v2ray-core and place it at:" -Color Yellow
-        Write-C "  $V2RayDir\v2ray.exe" -Color Yellow
+        Write-C "  If GitHub is blocked, manually download xray-core and place it at:" -Color Yellow
+        Write-C "  $XrayDir\xray.exe" -Color Yellow
         return $false
     }
 
     Write-Step ">>>" "Extracting..."
     try {
         # Remove old dir if exists
-        if (Test-Path $V2RayDir) { Remove-Item -Recurse -Force $V2RayDir }
-        Expand-Archive -Path $zipPath -DestinationPath $V2RayDir -Force
+        if (Test-Path $XrayDir) { Remove-Item -Recurse -Force $XrayDir }
+        Expand-Archive -Path $zipPath -DestinationPath $XrayDir -Force
         Remove-Item $zipPath -Force
     } catch {
         Write-Err "Failed to extract: $_"
         return $false
     }
 
-    if (Test-Path $V2RayExe) {
-        Write-Ok "V2Ray installed successfully"
+    if (Test-Path $XrayExe) {
+        Write-Ok "Xray installed successfully"
         return $true
     } else {
-        Write-Err "v2ray.exe not found after extraction"
+        Write-Err "xray.exe not found after extraction"
         return $false
     }
 }
@@ -525,13 +529,13 @@ function Test-ProxyConnection {
 Clear-Host
 Write-Host $Banner -ForegroundColor Cyan
 
-# ── Step 1: Install V2Ray ──
+# ── Step 1: Install Xray ──
 Write-Separator
 Write-C "  SETUP" -Color Cyan
 Write-Separator
 Write-C ""
 
-if (-not (Install-V2Ray)) {
+if (-not (Install-Xray)) {
     Write-C ""
     Write-Err "Setup failed. Please check your internet connection."
     Read-Host "  Press Enter to exit"
@@ -556,31 +560,32 @@ Write-Ok "Transport: $($server.Type) | Security: $($server.Security)"
 
 # ── Step 3: Generate config ──
 Write-C ""
-Write-Step ">>>" "Generating V2Ray config..."
-$configJson = Generate-V2RayConfig -Server $server
-$configJson | Set-Content -Path $ConfigPath -Encoding UTF8
+Write-Step ">>>" "Generating Xray config..."
+$configJson = Generate-XrayConfig -Server $server
+# Write UTF-8 without BOM (PS 5.1's -Encoding UTF8 adds BOM which Xray rejects)
+[System.IO.File]::WriteAllText($ConfigPath, $configJson, (New-Object System.Text.UTF8Encoding $false))
 Write-Ok "Config written to $ConfigPath"
 
-# ── Step 4: Start V2Ray ──
+# ── Step 4: Start Xray ──
 Write-C ""
 Write-Separator
 Write-C "  CONNECTING" -Color Cyan
 Write-Separator
 Write-C ""
-Write-Step ">>>" "Starting V2Ray tunnel..."
+Write-Step ">>>" "Starting Xray tunnel..."
 
-$v2rayProcess = Start-Process -FilePath $V2RayExe `
+$xrayProcess = Start-Process -FilePath $XrayExe `
     -ArgumentList "run", "-config", $ConfigPath `
     -WindowStyle Hidden `
     -PassThru
 
-if (-not $v2rayProcess -or $v2rayProcess.HasExited) {
-    Write-Err "Failed to start V2Ray process"
+if (-not $xrayProcess -or $xrayProcess.HasExited) {
+    Write-Err "Failed to start Xray process"
     Read-Host "  Press Enter to exit"
     exit 1
 }
 
-Write-Ok "V2Ray started (PID: $($v2rayProcess.Id))"
+Write-Ok "Xray started (PID: $($xrayProcess.Id))"
 
 # ── Step 5: Set system proxy ──
 Write-Step ">>>" "Setting system proxy -> 127.0.0.1:$LocalHttpPort"
@@ -626,8 +631,8 @@ try {
 Write-C ""
 Write-Step ">>>" "Cleaning up..."
 
-try { Stop-Process -Id $v2rayProcess.Id -Force -ErrorAction SilentlyContinue } catch {}
-Write-Ok "V2Ray process stopped"
+try { Stop-Process -Id $xrayProcess.Id -Force -ErrorAction SilentlyContinue } catch {}
+Write-Ok "Xray process stopped"
 
 Disable-SystemProxy
 Write-Ok "System proxy restored"
