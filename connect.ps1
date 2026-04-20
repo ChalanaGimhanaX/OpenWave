@@ -135,7 +135,9 @@ function Parse-VlessUri {
             $eqIdx = $pair.IndexOf('=')
             if ($eqIdx -gt 0) {
                 $k = $pair.Substring(0, $eqIdx)
-                $v = [System.Uri]::UnescapeDataString($pair.Substring($eqIdx + 1))
+                # Replace + with space (form-encoded), then URL-decode
+                $rawVal = $pair.Substring($eqIdx + 1).Replace('+', ' ')
+                $v = [System.Uri]::UnescapeDataString($rawVal)
                 $params[$k] = $v
             }
         }
@@ -218,6 +220,10 @@ function Generate-XrayConfig {
             $tlsSettings = @{
                 serverName  = $Server.SNI
                 fingerprint = $Server.Fingerprint
+            }
+            # Allow insecure when SNI differs from server address (CDN fronting)
+            if ($Server.SNI -ne $Server.Address) {
+                $tlsSettings["allowInsecure"] = $true
             }
             if ($Server.ALPN -ne "") {
                 $alpnValues = @()
@@ -417,7 +423,7 @@ function Install-Xray {
 }
 
 # ── Default Server ───────────────────────────────────────────────────────────
-$DefaultVlessUri = "vless://971f6640-6bb7-4c1f-ac21-8db3891c7562@rolex.netchlk.org:443?type=ws&path=%2F&host=&security=tls&fp=&alpn=h2%2Chttp%2F1.1&sni=aka.ms#zoom-chalana"
+$DefaultVlessUri = "vless://a9bc195c-5835-4830-ab5e-a7bf8f577800@sg1.nlkx.shop:443/?encryption=none&flow=none&security=tls&sni=aka.ms&alpn=h3%2c+h2%2c+http%2f1.1&type=tcp&headerType=none#zoom-chalana"
 
 # ── Get VLESS URI from user ─────────────────────────────────────────────────
 function Get-VlessUri {
