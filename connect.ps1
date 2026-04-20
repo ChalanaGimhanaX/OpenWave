@@ -63,10 +63,10 @@ function Write-Separator {
     Write-Host ("  " + ("-" * 62)) -ForegroundColor DarkGray
 }
 
-# Helper: get value from hashtable with default
+# Helper: get value from hashtable with default (treats empty string as missing)
 function Get-ParamOrDefault {
     param([hashtable]$Params, [string]$Key, [string]$Default)
-    if ($Params.ContainsKey($Key)) { return $Params[$Key] }
+    if ($Params.ContainsKey($Key) -and $Params[$Key] -ne "") { return $Params[$Key] }
     return $Default
 }
 
