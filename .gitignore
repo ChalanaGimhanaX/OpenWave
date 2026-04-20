@@ -1,0 +1,4 @@
+# OpenWave ignores
+.openwave/
+*.zip
+check.ps1

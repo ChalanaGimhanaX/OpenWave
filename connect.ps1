@@ -1,0 +1,639 @@
+<#
+.SYNOPSIS
+    OpenWave - One-click V2Ray/VLESS tunnel for restricted networks.
+.DESCRIPTION
+    Run with:  irm https://your-host.com/connect.ps1 | iex
+    Or locally: .\connect.ps1
+    Or with a VLESS URI: .\connect.ps1 -VlessUri "vless://..."
+#>
+
+param(
+    [string]$VlessUri
+)
+
+# ── Branding ─────────────────────────────────────────────────────────────────
+$Banner = @"
+
+   ██████╗ ██████╗ ███████╗███╗   ██╗██╗    ██╗ █████╗ ██╗   ██╗███████╗
+  ██╔═══██╗██╔══██╗██╔════╝████╗  ██║██║    ██║██╔══██╗██║   ██║██╔════╝
+  ██║   ██║██████╔╝█████╗  ██╔██╗ ██║██║ █╗ ██║███████║██║   ██║█████╗
+  ██║   ██║██╔═══╝ ██╔══╝  ██║╚██╗██║██║███╗██║██╔══██║╚██╗ ██╔╝██╔══╝
+  ╚██████╔╝██║     ███████╗██║ ╚████║╚███╔███╔╝██║  ██║ ╚████╔╝ ███████╗
+   ╚═════╝ ╚═╝     ╚══════╝╚═╝  ╚═══╝ ╚══╝╚══╝ ╚═╝  ╚═╝  ╚═══╝ ╚══════╝
+                     Bypass restrictions. Stay connected.
+
+"@
+
+# ── Config ───────────────────────────────────────────────────────────────────
+$V2RayVersion   = "5.22.0"
+$V2RayZipUrl    = "https://github.com/v2fly/v2ray-core/releases/download/v$V2RayVersion/v2ray-windows-64.zip"
+$InstallDir     = "$env:USERPROFILE\.openwave"
+$V2RayDir       = "$InstallDir\v2ray"
+$V2RayExe       = "$V2RayDir\v2ray.exe"
+$ConfigPath     = "$InstallDir\config.json"
+$LocalSocksPort = 10808
+$LocalHttpPort  = 10809
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+function Write-C {
+    param([string]$Text, [string]$Color = "White")
+    Write-Host $Text -ForegroundColor $Color
+}
+
+function Write-Step {
+    param([string]$Icon, [string]$Text)
+    Write-Host "  $Icon " -NoNewline -ForegroundColor Cyan
+    Write-Host $Text -ForegroundColor White
+}
+
+function Write-Ok {
+    param([string]$Text)
+    Write-Host "  [OK] " -NoNewline -ForegroundColor Green
+    Write-Host $Text -ForegroundColor Gray
+}
+
+function Write-Err {
+    param([string]$Text)
+    Write-Host "  [!!] " -NoNewline -ForegroundColor Red
+    Write-Host $Text -ForegroundColor White
+}
+
+function Write-Separator {
+    Write-Host ("  " + ("-" * 62)) -ForegroundColor DarkGray
+}
+
+# Helper: get value from hashtable with default
+function Get-ParamOrDefault {
+    param([hashtable]$Params, [string]$Key, [string]$Default)
+    if ($Params.ContainsKey($Key)) { return $Params[$Key] }
+    return $Default
+}
+
+# ── VLESS URI Parser ────────────────────────────────────────────────────────
+# Format: vless://uuid@host:port?type=tcp&security=tls&sni=example.com&fp=chrome&encryption=none#Name
+function Parse-VlessUri {
+    param([string]$Uri)
+
+    if (-not $Uri.StartsWith("vless://")) {
+        Write-Err "Invalid VLESS URI - must start with 'vless://'"
+        return $null
+    }
+
+    $stripped = $Uri.Substring(8)
+
+    # Split off the fragment (#Name)
+    $hashIdx = $stripped.LastIndexOf('#')
+    if ($hashIdx -ge 0) {
+        $main   = $stripped.Substring(0, $hashIdx)
+        $remark = [System.Uri]::UnescapeDataString($stripped.Substring($hashIdx + 1))
+    } else {
+        $main   = $stripped
+        $remark = "OpenWave Server"
+    }
+
+    # Split UUID from rest
+    $atIdx = $main.IndexOf('@')
+    if ($atIdx -lt 0) {
+        Write-Err "Cannot parse UUID from VLESS URI"
+        return $null
+    }
+    $uuid = $main.Substring(0, $atIdx)
+    $rest = $main.Substring($atIdx + 1)
+
+    # Split host:port from query
+    $qIdx = $rest.IndexOf('?')
+    if ($qIdx -ge 0) {
+        $hostPort = $rest.Substring(0, $qIdx)
+        $queryStr = $rest.Substring($qIdx + 1)
+    } else {
+        $hostPort = $rest
+        $queryStr = ""
+    }
+
+    # Parse host and port (handle IPv6)
+    $addr = $null
+    $port = 443
+    if ($hostPort -match '^\[(.+)\]:(\d+)$') {
+        $addr = $Matches[1]
+        $port = [int]$Matches[2]
+    } elseif ($hostPort -match '^(.+):(\d+)$') {
+        $addr = $Matches[1]
+        $port = [int]$Matches[2]
+    } else {
+        Write-Err "Cannot parse host:port from VLESS URI"
+        return $null
+    }
+
+    # Parse query parameters
+    $params = @{}
+    if ($queryStr -ne "") {
+        $pairs = $queryStr.Split('&')
+        foreach ($pair in $pairs) {
+            $eqIdx = $pair.IndexOf('=')
+            if ($eqIdx -gt 0) {
+                $k = $pair.Substring(0, $eqIdx)
+                $v = [System.Uri]::UnescapeDataString($pair.Substring($eqIdx + 1))
+                $params[$k] = $v
+            }
+        }
+    }
+
+    $result = @{
+        UUID        = $uuid
+        Address     = $addr
+        Port        = $port
+        Remark      = $remark
+        Type        = (Get-ParamOrDefault $params 'type'        'tcp')
+        Security    = (Get-ParamOrDefault $params 'security'    'none')
+        SNI         = (Get-ParamOrDefault $params 'sni'         $addr)
+        ALPN        = (Get-ParamOrDefault $params 'alpn'        '')
+        Path        = (Get-ParamOrDefault $params 'path'        '/')
+        Host        = (Get-ParamOrDefault $params 'host'        $addr)
+        Fingerprint = (Get-ParamOrDefault $params 'fp'          'chrome')
+        PbkKey      = (Get-ParamOrDefault $params 'pbk'         '')
+        Sid         = (Get-ParamOrDefault $params 'sid'         '')
+        Flow        = (Get-ParamOrDefault $params 'flow'        '')
+        HeaderType  = (Get-ParamOrDefault $params 'headerType'  'none')
+        Encryption  = (Get-ParamOrDefault $params 'encryption'  'none')
+        SpiderX     = (Get-ParamOrDefault $params 'spx'         '')
+        ServiceName = (Get-ParamOrDefault $params 'serviceName' '')
+        Mode        = (Get-ParamOrDefault $params 'mode'        'gun')
+    }
+    return $result
+}
+
+# ── Config Generator ────────────────────────────────────────────────────────
+function Generate-V2RayConfig {
+    param([hashtable]$Server)
+
+    # Build stream settings based on transport type
+    $streamSettings = @{
+        network = $Server.Type
+    }
+
+    # ── Transport settings ──
+    switch ($Server.Type) {
+        "ws" {
+            $streamSettings["wsSettings"] = @{
+                path = $Server.Path
+                headers = @{
+                    Host = $Server.Host
+                }
+            }
+        }
+        "grpc" {
+            $streamSettings["grpcSettings"] = @{
+                serviceName = $Server.ServiceName
+                multiMode   = ($Server.Mode -eq "multi")
+            }
+        }
+        "h2" {
+            $streamSettings["httpSettings"] = @{
+                path = $Server.Path
+                host = @($Server.Host)
+            }
+        }
+        "tcp" {
+            if ($Server.HeaderType -eq "http") {
+                $streamSettings["tcpSettings"] = @{
+                    header = @{
+                        type = "http"
+                        request = @{
+                            path = @($Server.Path)
+                            headers = @{ Host = @($Server.Host) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    # ── Security / TLS settings ──
+    switch ($Server.Security) {
+        "tls" {
+            $streamSettings["security"] = "tls"
+            $tlsSettings = @{
+                serverName  = $Server.SNI
+                fingerprint = $Server.Fingerprint
+            }
+            if ($Server.ALPN -ne "") {
+                $tlsSettings["alpn"] = @($Server.ALPN -split ',')
+            }
+            $streamSettings["tlsSettings"] = $tlsSettings
+        }
+        "reality" {
+            $streamSettings["security"] = "reality"
+            $streamSettings["realitySettings"] = @{
+                serverName  = $Server.SNI
+                fingerprint = $Server.Fingerprint
+                publicKey   = $Server.PbkKey
+                shortId     = $Server.Sid
+                spiderX     = $Server.SpiderX
+            }
+        }
+        default {
+            $streamSettings["security"] = "none"
+        }
+    }
+
+    # ── VLESS user ──
+    $vlessUser = @{
+        id         = $Server.UUID
+        encryption = $Server.Encryption
+        level      = 0
+    }
+    if ($Server.Flow -ne "") {
+        $vlessUser["flow"] = $Server.Flow
+    }
+
+    # ── Full config ──
+    $config = @{
+        log = @{
+            loglevel = "warning"
+        }
+        dns = @{
+            servers = @(
+                @{
+                    address = "8.8.8.8"
+                    domains = @("geosite:geolocation-!cn")
+                },
+                "1.1.1.1",
+                "localhost"
+            )
+        }
+        inbounds = @(
+            @{
+                tag      = "socks-in"
+                port     = $LocalSocksPort
+                listen   = "127.0.0.1"
+                protocol = "socks"
+                settings = @{
+                    auth = "noauth"
+                    udp  = $true
+                }
+                sniffing = @{
+                    enabled      = $true
+                    destOverride = @("http", "tls")
+                }
+            },
+            @{
+                tag      = "http-in"
+                port     = $LocalHttpPort
+                listen   = "127.0.0.1"
+                protocol = "http"
+                settings = @{}
+                sniffing = @{
+                    enabled      = $true
+                    destOverride = @("http", "tls")
+                }
+            }
+        )
+        outbounds = @(
+            @{
+                tag      = "proxy"
+                protocol = "vless"
+                settings = @{
+                    vnext = @(
+                        @{
+                            address = $Server.Address
+                            port    = $Server.Port
+                            users   = @($vlessUser)
+                        }
+                    )
+                }
+                streamSettings = $streamSettings
+            },
+            @{
+                tag      = "direct"
+                protocol = "freedom"
+                settings = @{}
+            },
+            @{
+                tag      = "block"
+                protocol = "blackhole"
+                settings = @{}
+            }
+        )
+        routing = @{
+            domainStrategy = "AsIs"
+            rules = @(
+                @{
+                    type        = "field"
+                    ip          = @("geoip:private")
+                    outboundTag = "direct"
+                },
+                @{
+                    type        = "field"
+                    domain      = @("geosite:category-ads-all")
+                    outboundTag = "block"
+                }
+            )
+        }
+    }
+
+    return $config | ConvertTo-Json -Depth 20
+}
+
+# ── Proxy Toggle ─────────────────────────────────────────────────────────────
+function Enable-SystemProxy {
+    param([int]$Port)
+    $regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+    Set-ItemProperty -Path $regPath -Name ProxyEnable  -Value 1
+    Set-ItemProperty -Path $regPath -Name ProxyServer  -Value "127.0.0.1:$Port"
+    # Bypass local addresses
+    Set-ItemProperty -Path $regPath -Name ProxyOverride -Value "<local>;localhost;127.*;10.*;192.168.*"
+
+    # Notify the system of proxy changes
+    $signature = '[DllImport("wininet.dll")] public static extern bool InternetSetOption(IntPtr hInternet, int dwOption, IntPtr lpBuffer, int dwBufferLength);'
+    $wininet = Add-Type -MemberDefinition $signature -Name WinInet -Namespace OpenWave -PassThru -ErrorAction SilentlyContinue
+    if ($wininet) {
+        $wininet::InternetSetOption(0, 39, 0, 0) | Out-Null
+        $wininet::InternetSetOption(0, 37, 0, 0) | Out-Null
+    }
+}
+
+function Disable-SystemProxy {
+    $regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+    Set-ItemProperty -Path $regPath -Name ProxyEnable -Value 0
+    Remove-ItemProperty -Path $regPath -Name ProxyServer  -ErrorAction SilentlyContinue
+    Remove-ItemProperty -Path $regPath -Name ProxyOverride -ErrorAction SilentlyContinue
+
+    $signature = '[DllImport("wininet.dll")] public static extern bool InternetSetOption(IntPtr hInternet, int dwOption, IntPtr lpBuffer, int dwBufferLength);'
+    $wininet = Add-Type -MemberDefinition $signature -Name WinInet2 -Namespace OpenWave -PassThru -ErrorAction SilentlyContinue
+    if ($wininet) {
+        $wininet::InternetSetOption(0, 39, 0, 0) | Out-Null
+        $wininet::InternetSetOption(0, 37, 0, 0) | Out-Null
+    }
+}
+
+# ── Download & Extract V2Ray ────────────────────────────────────────────────
+function Install-V2Ray {
+    if (Test-Path $V2RayExe) {
+        Write-Ok "V2Ray already installed at $V2RayDir"
+        return $true
+    }
+
+    Write-Step ">>>" "Downloading V2Ray v$V2RayVersion..."
+
+    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+    $zipPath = "$InstallDir\v2ray.zip"
+
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $ProgressPreference = 'SilentlyContinue'
+        Invoke-WebRequest -Uri $V2RayZipUrl -OutFile $zipPath -UseBasicParsing
+        $ProgressPreference = 'Continue'
+    } catch {
+        Write-Err "Failed to download V2Ray: $_"
+        Write-C ""
+        Write-C "  If GitHub is blocked, manually download v2ray-core and place it at:" -Color Yellow
+        Write-C "  $V2RayDir\v2ray.exe" -Color Yellow
+        return $false
+    }
+
+    Write-Step ">>>" "Extracting..."
+    try {
+        # Remove old dir if exists
+        if (Test-Path $V2RayDir) { Remove-Item -Recurse -Force $V2RayDir }
+        Expand-Archive -Path $zipPath -DestinationPath $V2RayDir -Force
+        Remove-Item $zipPath -Force
+    } catch {
+        Write-Err "Failed to extract: $_"
+        return $false
+    }
+
+    if (Test-Path $V2RayExe) {
+        Write-Ok "V2Ray installed successfully"
+        return $true
+    } else {
+        Write-Err "v2ray.exe not found after extraction"
+        return $false
+    }
+}
+
+# ── Default Server ───────────────────────────────────────────────────────────
+$DefaultVlessUri = "vless://971f6640-6bb7-4c1f-ac21-8db3891c7562@rolex.netchlk.org:443?type=ws&path=%2F&host=&security=tls&fp=&alpn=h2%2Chttp%2F1.1&sni=aka.ms#zoom-chalana"
+
+# ── Get VLESS URI from user ─────────────────────────────────────────────────
+function Get-VlessUri {
+    if ($VlessUri) {
+        return $VlessUri
+    }
+
+    # Check saved config
+    $savedFile = "$InstallDir\servers.txt"
+    $savedUris = @()
+    if (Test-Path $savedFile) {
+        $savedUris = @(Get-Content $savedFile | Where-Object { $_ -match '^vless://' })
+    }
+
+    Write-C ""
+    Write-Separator
+    Write-C "  SERVER CONFIGURATION" -Color Cyan
+    Write-Separator
+    Write-C ""
+
+    # Build menu options
+    $menuIndex = 0
+
+    # Show default server
+    $defaultParsed = Parse-VlessUri $DefaultVlessUri
+    if ($defaultParsed) {
+        Write-C "  Default server:" -Color Green
+        Write-C "    [D] $($defaultParsed.Remark) ($($defaultParsed.Address):$($defaultParsed.Port))" -Color White
+        Write-C ""
+    }
+
+    if ($savedUris.Count -gt 0) {
+        Write-C "  Saved servers:" -Color Yellow
+        for ($i = 0; $i -lt $savedUris.Count; $i++) {
+            $parsed = Parse-VlessUri $savedUris[$i]
+            if ($parsed) {
+                $label = "$($parsed.Remark) ($($parsed.Address):$($parsed.Port))"
+            } else {
+                $maxLen = [Math]::Min(60, $savedUris[$i].Length)
+                $label = $savedUris[$i].Substring(0, $maxLen) + "..."
+            }
+            Write-C "    [$($i+1)] $label" -Color White
+        }
+    }
+
+    Write-C "    [N] Add a new server" -Color DarkGray
+    Write-C ""
+    $prompt = "  Select [D]efault"
+    if ($savedUris.Count -gt 0) {
+        $prompt += ", (1-$($savedUris.Count))"
+    }
+    $prompt += ", or [N]ew"
+    $choice = Read-Host $prompt
+
+    # Default server
+    if ($choice -eq "" -or $choice.ToUpper() -eq "D") {
+        Write-Ok "Using default server"
+        return $DefaultVlessUri
+    }
+
+    # Saved server by number
+    if ($choice -match '^\d+$' -and [int]$choice -ge 1 -and [int]$choice -le $savedUris.Count) {
+        return $savedUris[[int]$choice - 1]
+    }
+
+    # New server
+    Write-C ""
+    Write-C "  Paste your VLESS URI below." -Color Yellow
+    Write-C "  Format: vless://uuid@host:port?params#Name" -Color DarkGray
+    Write-C ""
+    $uri = Read-Host "  VLESS URI"
+
+    if (-not $uri) {
+        Write-Err "No URI provided. Exiting."
+        return $null
+    }
+
+    # Save for next time
+    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+    $uri | Add-Content -Path $savedFile
+    Write-Ok "Server saved for future use"
+
+    return $uri
+}
+
+# ── Test Connection ──────────────────────────────────────────────────────────
+function Test-ProxyConnection {
+    param([int]$Port, [int]$Retries = 5)
+
+    for ($i = 1; $i -le $Retries; $i++) {
+        Start-Sleep -Seconds 2
+        try {
+            $proxy = New-Object System.Net.WebProxy("http://127.0.0.1:$Port")
+            $webClient = New-Object System.Net.WebClient
+            $webClient.Proxy = $proxy
+            $result = $webClient.DownloadString("http://httpbin.org/ip")
+            return $true
+        } catch {
+            Write-Host "  ... Attempt $i/$Retries - waiting for tunnel..." -ForegroundColor DarkGray
+        }
+    }
+    return $false
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN EXECUTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+Clear-Host
+Write-Host $Banner -ForegroundColor Cyan
+
+# ── Step 1: Install V2Ray ──
+Write-Separator
+Write-C "  SETUP" -Color Cyan
+Write-Separator
+Write-C ""
+
+if (-not (Install-V2Ray)) {
+    Write-C ""
+    Write-Err "Setup failed. Please check your internet connection."
+    Read-Host "  Press Enter to exit"
+    exit 1
+}
+
+# ── Step 2: Get server config ──
+$uri = Get-VlessUri
+if (-not $uri) { exit 1 }
+
+$server = Parse-VlessUri $uri
+if (-not $server) {
+    Write-Err "Failed to parse VLESS URI. Check the format and try again."
+    Read-Host "  Press Enter to exit"
+    exit 1
+}
+
+Write-C ""
+Write-Ok "Server: $($server.Remark)"
+Write-Ok "Address: $($server.Address):$($server.Port)"
+Write-Ok "Transport: $($server.Type) | Security: $($server.Security)"
+
+# ── Step 3: Generate config ──
+Write-C ""
+Write-Step ">>>" "Generating V2Ray config..."
+$configJson = Generate-V2RayConfig -Server $server
+$configJson | Set-Content -Path $ConfigPath -Encoding UTF8
+Write-Ok "Config written to $ConfigPath"
+
+# ── Step 4: Start V2Ray ──
+Write-C ""
+Write-Separator
+Write-C "  CONNECTING" -Color Cyan
+Write-Separator
+Write-C ""
+Write-Step ">>>" "Starting V2Ray tunnel..."
+
+$v2rayProcess = Start-Process -FilePath $V2RayExe `
+    -ArgumentList "run", "-config", $ConfigPath `
+    -WindowStyle Hidden `
+    -PassThru
+
+if (-not $v2rayProcess -or $v2rayProcess.HasExited) {
+    Write-Err "Failed to start V2Ray process"
+    Read-Host "  Press Enter to exit"
+    exit 1
+}
+
+Write-Ok "V2Ray started (PID: $($v2rayProcess.Id))"
+
+# ── Step 5: Set system proxy ──
+Write-Step ">>>" "Setting system proxy -> 127.0.0.1:$LocalHttpPort"
+Enable-SystemProxy -Port $LocalHttpPort
+Write-Ok "System HTTP proxy enabled"
+
+# ── Step 6: Test connection ──
+Write-C ""
+Write-Step ">>>" "Testing connection..."
+$connected = Test-ProxyConnection -Port $LocalHttpPort
+
+if ($connected) {
+    Write-C ""
+    Write-C "  ============================================================" -ForegroundColor Green
+    Write-C "                                                              " -ForegroundColor Green
+    Write-C "    CONNECTED - You're bypassing restrictions now!            " -ForegroundColor Green
+    Write-C "                                                              " -ForegroundColor Green
+    Write-C "    HTTP Proxy  -> 127.0.0.1:$LocalHttpPort                          " -ForegroundColor Green
+    Write-C "    SOCKS Proxy -> 127.0.0.1:$LocalSocksPort                          " -ForegroundColor Green
+    Write-C "                                                              " -ForegroundColor Green
+    Write-C "  ============================================================" -ForegroundColor Green
+} else {
+    Write-C ""
+    Write-C "  WARNING: Tunnel started but connectivity check failed." -ForegroundColor Yellow
+    Write-C "  The server might still be initializing or the VLESS config" -ForegroundColor Yellow
+    Write-C "  may need adjustment. Proxy is set - try browsing manually." -ForegroundColor Yellow
+}
+
+Write-C ""
+Write-Separator
+Write-C "  Press Enter to disconnect and restore settings." -Color DarkGray
+Write-Separator
+Write-C ""
+
+# ── Wait for user to disconnect ──
+try {
+    Read-Host "  Waiting... press Enter to disconnect"
+} catch {
+    # Ctrl+C caught
+}
+
+# ── Cleanup ──
+Write-C ""
+Write-Step ">>>" "Cleaning up..."
+
+try { Stop-Process -Id $v2rayProcess.Id -Force -ErrorAction SilentlyContinue } catch {}
+Write-Ok "V2Ray process stopped"
+
+Disable-SystemProxy
+Write-Ok "System proxy restored"
+
+Write-C ""
+Write-C "  ============================================================" -ForegroundColor Yellow
+Write-C "    DISCONNECTED - Original settings restored.                " -ForegroundColor Yellow
+Write-C "  ============================================================" -ForegroundColor Yellow
+Write-C ""
