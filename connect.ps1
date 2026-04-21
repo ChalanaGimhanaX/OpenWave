@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    OpenWave - One-click V2Ray/VLESS tunnel for restricted networks.
+    OpenWave - One-click Xray/VLESS tunnel for restricted networks.
 .DESCRIPTION
     Run with:  irm https://your-host.com/connect.ps1 | iex
     Or locally: .\connect.ps1
@@ -25,11 +25,11 @@ $Banner = @"
 "@
 
 # ── Config ───────────────────────────────────────────────────────────────────
-$V2RayVersion   = "5.22.0"
-$V2RayZipUrl    = "https://github.com/v2fly/v2ray-core/releases/download/v$V2RayVersion/v2ray-windows-64.zip"
+$XrayVersion    = "25.5.16"
+$XrayZipUrl     = "https://github.com/XTLS/Xray-core/releases/download/v$XrayVersion/Xray-windows-64.zip"
 $InstallDir     = "$env:USERPROFILE\.openwave"
-$V2RayDir       = "$InstallDir\v2ray"
-$V2RayExe       = "$V2RayDir\v2ray.exe"
+$XrayDir        = "$InstallDir\xray"
+$XrayExe        = "$XrayDir\xray.exe"
 $ConfigPath     = "$InstallDir\config.json"
 $LocalSocksPort = 10808
 $LocalHttpPort  = 10809
@@ -63,45 +63,71 @@ function Write-Separator {
     Write-Host ("  " + ("-" * 62)) -ForegroundColor DarkGray
 }
 
-# Helper: get value from hashtable with default
+# Helper: get value from hashtable with default (treats empty string as missing)
 function Get-ParamOrDefault {
     param([hashtable]$Params, [string]$Key, [string]$Default)
-    if ($Params.ContainsKey($Key)) { return $Params[$Key] }
+    if ($Params.ContainsKey($Key) -and $Params[$Key] -ne "") { return $Params[$Key] }
     return $Default
 }
 
-# ── VLESS URI Parser ────────────────────────────────────────────────────────
-# Format: vless://uuid@host:port?type=tcp&security=tls&sni=example.com&fp=chrome&encryption=none#Name
-function Parse-VlessUri {
+# ── Proxy URI Parser ────────────────────────────────────────────────────────
+# Supports VLESS, VMESS, TROJAN
+function Parse-ProxyUri {
     param([string]$Uri)
 
-    if (-not $Uri.StartsWith("vless://")) {
-        Write-Err "Invalid VLESS URI - must start with 'vless://'"
+    if ($Uri.StartsWith("vmess://")) {
+        $base64 = $Uri.Substring(8)
+        $pad = $base64.Length % 4
+        if ($pad -ne 0) { $base64 += "=" * (4 - $pad) }
+        try {
+            $json = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($base64))
+            $v = $json | ConvertFrom-Json
+            
+            return @{
+                Protocol    = "vmess"
+                Remark      = if ($v.ps) { $v.ps } else { "OpenWave VMESS" }
+                Address     = $v.add
+                Port        = [int]$v.port
+                UUID        = $v.id
+                AlterId     = if ($null -ne $v.aid) { [int]$v.aid } else { 0 }
+                Type        = if ($v.net) { $v.net } else { "tcp" }
+                Security    = if ($v.tls -eq "tls" -or $v.tls -eq "reality") { $v.tls } else { "none" }
+                SNI         = if ($v.sni) { $v.sni } elseif ($v.host) { $v.host } else { $v.add }
+                Host        = if ($v.host) { $v.host } else { "" }
+                Path        = if ($v.path) { $v.path } else { "/" }
+                ALPN        = if ($v.alpn) { $v.alpn } else { "" }
+                Fingerprint = if ($v.fp) { $v.fp } else { "chrome" }
+                ServiceName = ""
+            }
+        } catch {
+            Write-Err "Failed to parse VMESS URI"
+            return $null
+        }
+    }
+
+    $protocol = ""
+    $stripped = ""
+    if ($Uri.StartsWith("vless://")) { $protocol = "vless"; $stripped = $Uri.Substring(8) }
+    elseif ($Uri.StartsWith("trojan://")) { $protocol = "trojan"; $stripped = $Uri.Substring(9) }
+    else {
+        Write-Err "Unsupported URI scheme. Supported: vless, vmess, trojan."
         return $null
     }
 
-    $stripped = $Uri.Substring(8)
-
-    # Split off the fragment (#Name)
     $hashIdx = $stripped.LastIndexOf('#')
     if ($hashIdx -ge 0) {
         $main   = $stripped.Substring(0, $hashIdx)
         $remark = [System.Uri]::UnescapeDataString($stripped.Substring($hashIdx + 1))
     } else {
         $main   = $stripped
-        $remark = "OpenWave Server"
+        $remark = "OpenWave $protocol"
     }
 
-    # Split UUID from rest
     $atIdx = $main.IndexOf('@')
-    if ($atIdx -lt 0) {
-        Write-Err "Cannot parse UUID from VLESS URI"
-        return $null
-    }
-    $uuid = $main.Substring(0, $atIdx)
+    if ($atIdx -lt 0) { return $null }
+    $credentials = $main.Substring(0, $atIdx)
     $rest = $main.Substring($atIdx + 1)
 
-    # Split host:port from query
     $qIdx = $rest.IndexOf('?')
     if ($qIdx -ge 0) {
         $hostPort = $rest.Substring(0, $qIdx)
@@ -110,61 +136,55 @@ function Parse-VlessUri {
         $hostPort = $rest
         $queryStr = ""
     }
+    $hostPort = $hostPort.TrimEnd('/')
 
-    # Parse host and port (handle IPv6)
-    $addr = $null
-    $port = 443
+    $addr = $null; $port = 443
     if ($hostPort -match '^\[(.+)\]:(\d+)$') {
-        $addr = $Matches[1]
-        $port = [int]$Matches[2]
+        $addr = $Matches[1]; $port = [int]$Matches[2]
     } elseif ($hostPort -match '^(.+):(\d+)$') {
-        $addr = $Matches[1]
-        $port = [int]$Matches[2]
+        $addr = $Matches[1]; $port = [int]$Matches[2]
     } else {
-        Write-Err "Cannot parse host:port from VLESS URI"
         return $null
     }
 
-    # Parse query parameters
     $params = @{}
     if ($queryStr -ne "") {
-        $pairs = $queryStr.Split('&')
-        foreach ($pair in $pairs) {
+        foreach ($pair in $queryStr.Split('&')) {
             $eqIdx = $pair.IndexOf('=')
             if ($eqIdx -gt 0) {
-                $k = $pair.Substring(0, $eqIdx)
-                $v = [System.Uri]::UnescapeDataString($pair.Substring($eqIdx + 1))
-                $params[$k] = $v
+                $rawVal = $pair.Substring($eqIdx + 1).Replace('+', ' ')
+                $params[$pair.Substring(0, $eqIdx)] = [System.Uri]::UnescapeDataString($rawVal)
             }
         }
     }
 
-    $result = @{
-        UUID        = $uuid
+    return @{
+        Protocol    = $protocol
+        UUID        = if ($protocol -eq "vless") { $credentials } else { "" }
+        Password    = if ($protocol -eq "trojan") { $credentials } else { "" }
+        Remark      = $remark
         Address     = $addr
         Port        = $port
-        Remark      = $remark
-        Type        = (Get-ParamOrDefault $params 'type'        'tcp')
-        Security    = (Get-ParamOrDefault $params 'security'    'none')
-        SNI         = (Get-ParamOrDefault $params 'sni'         $addr)
-        ALPN        = (Get-ParamOrDefault $params 'alpn'        '')
-        Path        = (Get-ParamOrDefault $params 'path'        '/')
-        Host        = (Get-ParamOrDefault $params 'host'        $addr)
-        Fingerprint = (Get-ParamOrDefault $params 'fp'          'chrome')
-        PbkKey      = (Get-ParamOrDefault $params 'pbk'         '')
-        Sid         = (Get-ParamOrDefault $params 'sid'         '')
-        Flow        = (Get-ParamOrDefault $params 'flow'        '')
-        HeaderType  = (Get-ParamOrDefault $params 'headerType'  'none')
-        Encryption  = (Get-ParamOrDefault $params 'encryption'  'none')
-        SpiderX     = (Get-ParamOrDefault $params 'spx'         '')
+        Type        = (Get-ParamOrDefault $params 'type' 'tcp')
+        Security    = (Get-ParamOrDefault $params 'security' 'none')
+        SNI         = (Get-ParamOrDefault $params 'sni' $addr)
+        ALPN        = (Get-ParamOrDefault $params 'alpn' '')
+        Path        = (Get-ParamOrDefault $params 'path' '/')
+        Host        = (Get-ParamOrDefault $params 'host' $addr)
+        Fingerprint = (Get-ParamOrDefault $params 'fp' 'chrome')
+        PbkKey      = (Get-ParamOrDefault $params 'pbk' '')
+        Sid         = (Get-ParamOrDefault $params 'sid' '')
+        Flow        = (Get-ParamOrDefault $params 'flow' '')
+        HeaderType  = (Get-ParamOrDefault $params 'headerType' 'none')
+        Encryption  = (Get-ParamOrDefault $params 'encryption' 'none')
+        SpiderX     = (Get-ParamOrDefault $params 'spx' '')
         ServiceName = (Get-ParamOrDefault $params 'serviceName' '')
-        Mode        = (Get-ParamOrDefault $params 'mode'        'gun')
+        Mode        = (Get-ParamOrDefault $params 'mode' 'gun')
     }
-    return $result
 }
 
 # ── Config Generator ────────────────────────────────────────────────────────
-function Generate-V2RayConfig {
+function Generate-XrayConfig {
     param([hashtable]$Server)
 
     # Build stream settings based on transport type
@@ -217,8 +237,21 @@ function Generate-V2RayConfig {
                 serverName  = $Server.SNI
                 fingerprint = $Server.Fingerprint
             }
+            # Allow insecure when SNI differs from server address (CDN fronting)
+            if ($Server.SNI -ne $Server.Address) {
+                $tlsSettings["allowInsecure"] = $true
+            }
             if ($Server.ALPN -ne "") {
-                $tlsSettings["alpn"] = @($Server.ALPN -split ',')
+                $alpnValues = @()
+                foreach ($a in ($Server.ALPN -split ',')) {
+                    $trimmed = $a.Trim()
+                    # Filter out h3 (QUIC) when using TCP transport - incompatible
+                    if ($trimmed -eq "h3" -and $Server.Type -eq "tcp") { continue }
+                    if ($trimmed -ne "") { $alpnValues += $trimmed }
+                }
+                if ($alpnValues.Count -gt 0) {
+                    $tlsSettings["alpn"] = $alpnValues
+                }
             }
             $streamSettings["tlsSettings"] = $tlsSettings
         }
@@ -237,20 +270,41 @@ function Generate-V2RayConfig {
         }
     }
 
-    # ── VLESS user ──
-    $vlessUser = @{
-        id         = $Server.UUID
-        encryption = $Server.Encryption
-        level      = 0
-    }
-    if ($Server.Flow -ne "") {
-        $vlessUser["flow"] = $Server.Flow
+    # ── Protocol-specific Outbound Settings ──
+    $outboundSettings = @{}
+    if ($Server.Protocol -eq "vless") {
+        $vlessUser = @{
+            id         = $Server.UUID
+            encryption = if ($Server.Encryption) { $Server.Encryption } else { "none" }
+            level      = 0
+        }
+        if ($Server.Flow -ne "" -and $Server.Flow -ne "none") { $vlessUser["flow"] = $Server.Flow }
+        $outboundSettings = @{
+            vnext = @( @{ address = $Server.Address; port = $Server.Port; users = @($vlessUser) } )
+        }
+    } elseif ($Server.Protocol -eq "vmess") {
+        $outboundSettings = @{
+            vnext = @( @{
+                address = $Server.Address
+                port    = $Server.Port
+                users   = @( @{ id = $Server.UUID; alterId = $Server.AlterId; security = "auto"; level = 0 } )
+            })
+        }
+    } elseif ($Server.Protocol -eq "trojan") {
+        $outboundSettings = @{
+            servers = @( @{
+                address  = $Server.Address
+                port     = $Server.Port
+                password = $Server.Password
+                level    = 0
+            })
+        }
     }
 
     # ── Full config ──
     $config = @{
         log = @{
-            loglevel = "warning"
+            loglevel = "info"
         }
         dns = @{
             servers = @(
@@ -292,16 +346,8 @@ function Generate-V2RayConfig {
         outbounds = @(
             @{
                 tag      = "proxy"
-                protocol = "vless"
-                settings = @{
-                    vnext = @(
-                        @{
-                            address = $Server.Address
-                            port    = $Server.Port
-                            users   = @($vlessUser)
-                        }
-                    )
-                }
+                protocol = $Server.Protocol
+                settings = $outboundSettings
                 streamSettings = $streamSettings
             },
             @{
@@ -316,7 +362,7 @@ function Generate-V2RayConfig {
             }
         )
         routing = @{
-            domainStrategy = "AsIs"
+            domainStrategy = "IPIfNonMatch"
             rules = @(
                 @{
                     type        = "field"
@@ -327,6 +373,11 @@ function Generate-V2RayConfig {
                     type        = "field"
                     domain      = @("geosite:category-ads-all")
                     outboundTag = "block"
+                },
+                @{
+                    type        = "field"
+                    port        = "0-65535"
+                    outboundTag = "proxy"
                 }
             )
         }
@@ -367,53 +418,52 @@ function Disable-SystemProxy {
     }
 }
 
-# ── Download & Extract V2Ray ────────────────────────────────────────────────
-function Install-V2Ray {
-    if (Test-Path $V2RayExe) {
-        Write-Ok "V2Ray already installed at $V2RayDir"
+# ── Download & Extract Xray ─────────────────────────────────────────────────
+function Install-Xray {
+    if (Test-Path $XrayExe) {
+        Write-Ok "Xray already installed at $XrayDir"
         return $true
     }
 
-    Write-Step ">>>" "Downloading V2Ray v$V2RayVersion..."
+    Write-Step ">>>" "Downloading Xray v$XrayVersion..."
 
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-    $zipPath = "$InstallDir\v2ray.zip"
+    $zipPath = "$InstallDir\xray.zip"
 
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        $ProgressPreference = 'SilentlyContinue'
-        Invoke-WebRequest -Uri $V2RayZipUrl -OutFile $zipPath -UseBasicParsing
-        $ProgressPreference = 'Continue'
+        # Progress Preference intentionally left to default to show download loading bar
+        Invoke-WebRequest -Uri $XrayZipUrl -OutFile $zipPath -UseBasicParsing
     } catch {
-        Write-Err "Failed to download V2Ray: $_"
+        Write-Err "Failed to download Xray: $_"
         Write-C ""
-        Write-C "  If GitHub is blocked, manually download v2ray-core and place it at:" -Color Yellow
-        Write-C "  $V2RayDir\v2ray.exe" -Color Yellow
+        Write-C "  If GitHub is blocked, manually download xray-core and place it at:" -Color Yellow
+        Write-C "  $XrayDir\xray.exe" -Color Yellow
         return $false
     }
 
     Write-Step ">>>" "Extracting..."
     try {
         # Remove old dir if exists
-        if (Test-Path $V2RayDir) { Remove-Item -Recurse -Force $V2RayDir }
-        Expand-Archive -Path $zipPath -DestinationPath $V2RayDir -Force
+        if (Test-Path $XrayDir) { Remove-Item -Recurse -Force $XrayDir }
+        Expand-Archive -Path $zipPath -DestinationPath $XrayDir -Force
         Remove-Item $zipPath -Force
     } catch {
         Write-Err "Failed to extract: $_"
         return $false
     }
 
-    if (Test-Path $V2RayExe) {
-        Write-Ok "V2Ray installed successfully"
+    if (Test-Path $XrayExe) {
+        Write-Ok "Xray installed successfully"
         return $true
     } else {
-        Write-Err "v2ray.exe not found after extraction"
+        Write-Err "xray.exe not found after extraction"
         return $false
     }
 }
 
 # ── Default Server ───────────────────────────────────────────────────────────
-$DefaultVlessUri = "vless://971f6640-6bb7-4c1f-ac21-8db3891c7562@rolex.netchlk.org:443?type=ws&path=%2F&host=&security=tls&fp=&alpn=h2%2Chttp%2F1.1&sni=aka.ms#zoom-chalana"
+$DefaultVlessUri = "vless://a9bc195c-5835-4830-ab5e-a7bf8f577800@sg1.nlkx.shop:443/?encryption=none&flow=none&security=tls&sni=aka.ms&alpn=h3%2c+h2%2c+http%2f1.1&type=tcp&headerType=none#zoom-chalana"
 
 # ── Get VLESS URI from user ─────────────────────────────────────────────────
 function Get-VlessUri {
@@ -425,7 +475,7 @@ function Get-VlessUri {
     $savedFile = "$InstallDir\servers.txt"
     $savedUris = @()
     if (Test-Path $savedFile) {
-        $savedUris = @(Get-Content $savedFile | Where-Object { $_ -match '^vless://' })
+        $savedUris = @(Get-Content $savedFile | Where-Object { $_ -match '^(vless|vmess|trojan)://' })
     }
 
     Write-C ""
@@ -438,7 +488,7 @@ function Get-VlessUri {
     $menuIndex = 0
 
     # Show default server
-    $defaultParsed = Parse-VlessUri $DefaultVlessUri
+    $defaultParsed = Parse-ProxyUri $DefaultVlessUri
     if ($defaultParsed) {
         Write-C "  Default server:" -Color Green
         Write-C "    [D] $($defaultParsed.Remark) ($($defaultParsed.Address):$($defaultParsed.Port))" -Color White
@@ -448,7 +498,7 @@ function Get-VlessUri {
     if ($savedUris.Count -gt 0) {
         Write-C "  Saved servers:" -Color Yellow
         for ($i = 0; $i -lt $savedUris.Count; $i++) {
-            $parsed = Parse-VlessUri $savedUris[$i]
+            $parsed = Parse-ProxyUri $savedUris[$i]
             if ($parsed) {
                 $label = "$($parsed.Remark) ($($parsed.Address):$($parsed.Port))"
             } else {
@@ -482,7 +532,7 @@ function Get-VlessUri {
     # New server
     Write-C ""
     Write-C "  Paste your VLESS URI below." -Color Yellow
-    Write-C "  Format: vless://uuid@host:port?params#Name" -Color DarkGray
+    Write-C "  Format: vless://, vmess://, trojan:// URI" -Color DarkGray
     Write-C ""
     $uri = Read-Host "  VLESS URI"
 
@@ -501,7 +551,19 @@ function Get-VlessUri {
 
 # ── Test Connection ──────────────────────────────────────────────────────────
 function Test-ProxyConnection {
-    param([int]$Port, [int]$Retries = 5)
+    param([int]$Port, [int]$Retries = 6)
+
+    # First get our real IP (direct, no proxy)
+    $realIp = $null
+    try {
+        $wc = New-Object System.Net.WebClient
+        $wc.Proxy = [System.Net.GlobalProxySelection]::GetEmptyWebProxy()
+        $directResult = $wc.DownloadString("https://api.ipify.org")
+        $realIp = $directResult.Trim()
+        Write-Host "  [i] Your real IP: $realIp" -ForegroundColor DarkGray
+    } catch {
+        Write-Host "  [i] Could not determine real IP (network may be restricted)" -ForegroundColor DarkGray
+    }
 
     for ($i = 1; $i -le $Retries; $i++) {
         Start-Sleep -Seconds 2
@@ -509,7 +571,16 @@ function Test-ProxyConnection {
             $proxy = New-Object System.Net.WebProxy("http://127.0.0.1:$Port")
             $webClient = New-Object System.Net.WebClient
             $webClient.Proxy = $proxy
-            $result = $webClient.DownloadString("http://httpbin.org/ip")
+            $result = $webClient.DownloadString("https://api.ipify.org")
+            $proxyIp = $result.Trim()
+
+            if ($realIp -and $proxyIp -eq $realIp) {
+                Write-Host "  ... Attempt $i/$Retries - proxy IP same as real IP, tunnel may not be routing..." -ForegroundColor Yellow
+                continue
+            }
+
+            # Store proxy IP for display
+            $script:DetectedProxyIp = $proxyIp
             return $true
         } catch {
             Write-Host "  ... Attempt $i/$Retries - waiting for tunnel..." -ForegroundColor DarkGray
@@ -525,13 +596,13 @@ function Test-ProxyConnection {
 Clear-Host
 Write-Host $Banner -ForegroundColor Cyan
 
-# ── Step 1: Install V2Ray ──
+# ── Step 1: Install Xray ──
 Write-Separator
 Write-C "  SETUP" -Color Cyan
 Write-Separator
 Write-C ""
 
-if (-not (Install-V2Ray)) {
+if (-not (Install-Xray)) {
     Write-C ""
     Write-Err "Setup failed. Please check your internet connection."
     Read-Host "  Press Enter to exit"
@@ -542,7 +613,7 @@ if (-not (Install-V2Ray)) {
 $uri = Get-VlessUri
 if (-not $uri) { exit 1 }
 
-$server = Parse-VlessUri $uri
+$server = Parse-ProxyUri $uri
 if (-not $server) {
     Write-Err "Failed to parse VLESS URI. Check the format and try again."
     Read-Host "  Press Enter to exit"
@@ -556,36 +627,107 @@ Write-Ok "Transport: $($server.Type) | Security: $($server.Security)"
 
 # ── Step 3: Generate config ──
 Write-C ""
-Write-Step ">>>" "Generating V2Ray config..."
-$configJson = Generate-V2RayConfig -Server $server
-$configJson | Set-Content -Path $ConfigPath -Encoding UTF8
+Write-Step ">>>" "Generating Xray config..."
+$configJson = Generate-XrayConfig -Server $server
+# Write UTF-8 without BOM (PS 5.1's -Encoding UTF8 adds BOM which Xray rejects)
+[System.IO.File]::WriteAllText($ConfigPath, $configJson, (New-Object System.Text.UTF8Encoding $false))
 Write-Ok "Config written to $ConfigPath"
 
-# ── Step 4: Start V2Ray ──
+# ── Step 4: Start Xray ──
 Write-C ""
 Write-Separator
 Write-C "  CONNECTING" -Color Cyan
 Write-Separator
 Write-C ""
-Write-Step ">>>" "Starting V2Ray tunnel..."
+Write-Step ">>>" "Starting Xray tunnel..."
 
-$v2rayProcess = Start-Process -FilePath $V2RayExe `
+$xrayLogFile = "$InstallDir\xray-log.txt"
+$xrayProcess = Start-Process -FilePath $XrayExe `
     -ArgumentList "run", "-config", $ConfigPath `
     -WindowStyle Hidden `
+    -RedirectStandardOutput $xrayLogFile `
+    -RedirectStandardError "$InstallDir\xray-err.txt" `
     -PassThru
 
-if (-not $v2rayProcess -or $v2rayProcess.HasExited) {
-    Write-Err "Failed to start V2Ray process"
+if (-not $xrayProcess -or $xrayProcess.HasExited) {
+    Write-Err "Failed to start Xray process"
     Read-Host "  Press Enter to exit"
     exit 1
 }
 
-Write-Ok "V2Ray started (PID: $($v2rayProcess.Id))"
+Write-Ok "Xray started (PID: $($xrayProcess.Id))"
 
-# ── Step 5: Set system proxy ──
-Write-Step ">>>" "Setting system proxy -> 127.0.0.1:$LocalHttpPort"
-Enable-SystemProxy -Port $LocalHttpPort
-Write-Ok "System HTTP proxy enabled"
+try {
+    # ── Step 5: Set system proxy ──
+    Write-Step ">>>" "Setting system proxy -> 127.0.0.1:$LocalHttpPort"
+    Enable-SystemProxy -Port $LocalHttpPort
+    Write-Ok "System HTTP proxy enabled"
+
+    # ── Step 5b: Start background watchdog (Fully Detached via cmd) ──
+    $xrayPid = $xrayProcess.Id
+    $xrayDirForWD = $XrayDir
+    $confDirForWD = $ConfigPath
+    $logDirForWD  = "$InstallDir\xray-log.txt"
+    $errDirForWD  = "$InstallDir\xray-err.txt"
+    $wdPidFile    = "$InstallDir\wd.pid"
+    $zipDirForWD  = "$InstallDir\xray.zip"
+
+    $watchdogScript = @"
+`$PID | Out-File -FilePath `"$wdPidFile`"
+while (Get-Process -Id $PID -ErrorAction SilentlyContinue) { Start-Sleep -Seconds 2 }
+Stop-Process -Id $xrayPid -Force -ErrorAction SilentlyContinue
+Stop-Process -Name xray -Force -ErrorAction SilentlyContinue
+`$regPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+Set-ItemProperty -Path `$regPath -Name ProxyEnable -Value 0
+Remove-ItemProperty -Path `$regPath -Name ProxyServer   -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path `$regPath -Name ProxyOverride -ErrorAction SilentlyContinue
+`$sig = '[DllImport("wininet.dll")] public static extern bool InternetSetOption(IntPtr h, int d, IntPtr b, int l);'
+`$win = Add-Type -MemberDefinition `$sig -Name WD -Namespace OW -PassThru -ErrorAction SilentlyContinue
+if (`$win) { `$win::InternetSetOption(0, 39, 0, 0) | Out-Null; `$win::InternetSetOption(0, 37, 0, 0) | Out-Null }
+if (Test-Path `"$xrayDirForWD`") { Remove-Item -Recurse -Force `"$xrayDirForWD`" -ErrorAction SilentlyContinue }
+if (Test-Path `"$confDirForWD`") { Remove-Item -Force `"$confDirForWD`" -ErrorAction SilentlyContinue }
+if (Test-Path `"$logDirForWD`")  { Remove-Item -Force `"$logDirForWD`" -ErrorAction SilentlyContinue }
+if (Test-Path `"$errDirForWD`")  { Remove-Item -Force `"$errDirForWD`" -ErrorAction SilentlyContinue }
+if (Test-Path `"$zipDirForWD`")  { Remove-Item -Force `"$zipDirForWD`" -ErrorAction SilentlyContinue }
+if (Test-Path `"$wdPidFile`")    { Remove-Item -Force `"$wdPidFile`" -ErrorAction SilentlyContinue }
+"@
+    $encodedWatchdog = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($watchdogScript))
+    
+    # 'cmd /c start' acts as a breakaway trigger. The cmd exits immediately and PowerShell detaches to root!
+    $detachedCmd = "/c start `"`" /MIN powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -NoProfile -EncodedCommand $encodedWatchdog"
+    Start-Process cmd.exe -ArgumentList $detachedCmd -WindowStyle Hidden
+    Write-Ok "Watchdog started (Fully detached process, immune to Task Manager)"
+
+# ── Step 5b: Check for conflicting Chrome extensions ──
+$extPathBase = "$env:LOCALAPPDATA\Google\Chrome\User Data"
+if (Test-Path $extPathBase) {
+    $manifests = Get-ChildItem -Path "$extPathBase\*\Extensions\*\*\manifest.json" -ErrorAction SilentlyContinue
+    $blockingExts = @()
+    foreach ($mFile in $manifests) {
+        $manifest = Get-Content $mFile.FullName -Raw | ConvertFrom-Json -ErrorAction SilentlyContinue
+        if ($manifest -and $manifest.permissions -contains "proxy") {
+            $name = $manifest.name
+            if ($name -match "__MSG_") { $name = "A VPN/Proxy Extension ($($mFile.Directory.Parent.Name))" }
+            $blockingExts += $name
+        }
+    }
+    $blockingExts = $blockingExts | Select-Object -Unique
+    
+    if ($blockingExts.Count -gt 0) {
+        Write-C ""
+        Write-C "  [!!] ACTION REQUIRED: Conflicting Chrome Extensions [!!]" -ForegroundColor Red
+        Write-C "  The following extensions control your proxy and WILL block the tunnel:" -ForegroundColor Yellow
+        foreach ($ext in $blockingExts) {
+            Write-C "    - $ext" -ForegroundColor White
+        }
+        Write-C ""
+        Write-C "  To fix this:" -ForegroundColor Cyan
+        Write-C "  1. Open Chrome and go to: chrome://extensions" -ForegroundColor White
+        Write-C "  2. Turn OFF the extensions listed above" -ForegroundColor White
+        Write-C ""
+        Read-Host "  Press Enter once you have disabled them to continue"
+    }
+}
 
 # ── Step 6: Test connection ──
 Write-C ""
@@ -593,20 +735,23 @@ Write-Step ">>>" "Testing connection..."
 $connected = Test-ProxyConnection -Port $LocalHttpPort
 
 if ($connected) {
+    $ipLine = if ($script:DetectedProxyIp) { "    Tunnel IP   -> $($script:DetectedProxyIp)" } else { "" }
     Write-C ""
     Write-C "  ============================================================" -ForegroundColor Green
     Write-C "                                                              " -ForegroundColor Green
     Write-C "    CONNECTED - You're bypassing restrictions now!            " -ForegroundColor Green
     Write-C "                                                              " -ForegroundColor Green
+    if ($ipLine) { Write-C "$ipLine" -ForegroundColor Green }
     Write-C "    HTTP Proxy  -> 127.0.0.1:$LocalHttpPort                          " -ForegroundColor Green
     Write-C "    SOCKS Proxy -> 127.0.0.1:$LocalSocksPort                          " -ForegroundColor Green
     Write-C "                                                              " -ForegroundColor Green
     Write-C "  ============================================================" -ForegroundColor Green
 } else {
     Write-C ""
-    Write-C "  WARNING: Tunnel started but connectivity check failed." -ForegroundColor Yellow
-    Write-C "  The server might still be initializing or the VLESS config" -ForegroundColor Yellow
-    Write-C "  may need adjustment. Proxy is set - try browsing manually." -ForegroundColor Yellow
+    Write-C "  WARNING: Tunnel started but the IP did not change." -ForegroundColor Yellow
+    Write-C "  The VLESS server may be misconfigured or unreachable." -ForegroundColor Yellow
+    Write-C "  Check Xray logs at: $InstallDir\xray-log.txt" -ForegroundColor Yellow
+    Write-C "  Proxy is set - you can try browsing manually." -ForegroundColor Yellow
 }
 
 Write-C ""
@@ -615,25 +760,42 @@ Write-C "  Press Enter to disconnect and restore settings." -Color DarkGray
 Write-Separator
 Write-C ""
 
-# ── Wait for user to disconnect ──
-try {
-    Read-Host "  Waiting... press Enter to disconnect"
-} catch {
-    # Ctrl+C caught
+    # ── Wait for user to disconnect ──
+    try {
+        Read-Host "  Waiting... press Enter to disconnect"
+    } catch {
+        # Ctrl+C caught
+    }
+} finally {
+    # ── Cleanup ──
+    Write-C ""
+    Write-Step ">>>" "Cleaning up..."
+
+    # Kill the watchdog cleanly via PID file to prevent redundant background cleanup
+    $wdPidFile = "$InstallDir\wd.pid"
+    if (Test-Path $wdPidFile) {
+        $wdPid = Get-Content $wdPidFile -ErrorAction SilentlyContinue
+        if ($wdPid) { try { Stop-Process -Id $wdPid -Force -ErrorAction SilentlyContinue } catch {} }
+        Remove-Item -Force $wdPidFile -ErrorAction SilentlyContinue
+    }
+
+    try { Stop-Process -Id $xrayProcess.Id -Force -ErrorAction SilentlyContinue } catch {}
+    Write-Ok "Xray process stopped"
+
+    Disable-SystemProxy
+    Write-Ok "System proxy restored"
+
+    Write-Step ">>>" "Removing downloaded files & logs..."
+    if (Test-Path $XrayDir) { Remove-Item -Recurse -Force $XrayDir -ErrorAction SilentlyContinue }
+    if (Test-Path "$InstallDir\xray.zip") { Remove-Item -Force "$InstallDir\xray.zip" -ErrorAction SilentlyContinue }
+    if (Test-Path $ConfigPath) { Remove-Item -Force $ConfigPath -ErrorAction SilentlyContinue }
+    if (Test-Path "$InstallDir\xray-log.txt") { Remove-Item -Force "$InstallDir\xray-log.txt" -ErrorAction SilentlyContinue }
+    if (Test-Path "$InstallDir\xray-err.txt") { Remove-Item -Force "$InstallDir\xray-err.txt" -ErrorAction SilentlyContinue }
+    Write-Ok "Cleanup complete."
+
+    Write-C ""
+    Write-C "  ============================================================" -ForegroundColor Yellow
+    Write-C "    DISCONNECTED - Original settings restored.                " -ForegroundColor Yellow
+    Write-C "  ============================================================" -ForegroundColor Yellow
+    Write-C ""
 }
-
-# ── Cleanup ──
-Write-C ""
-Write-Step ">>>" "Cleaning up..."
-
-try { Stop-Process -Id $v2rayProcess.Id -Force -ErrorAction SilentlyContinue } catch {}
-Write-Ok "V2Ray process stopped"
-
-Disable-SystemProxy
-Write-Ok "System proxy restored"
-
-Write-C ""
-Write-C "  ============================================================" -ForegroundColor Yellow
-Write-C "    DISCONNECTED - Original settings restored.                " -ForegroundColor Yellow
-Write-C "  ============================================================" -ForegroundColor Yellow
-Write-C ""

@@ -1,0 +1,15 @@
+{
+"log": {"loglevel":"info"},
+"inbounds": [
+  {
+    "tag": "tun-in",
+    "protocol": "tun",
+    "port": 10810,
+    "settings": {
+      "network": "10.0.0.1/24",
+      "autoRoute": true,
+      "strictRoute": true
+    }
+  }
+]
+}
