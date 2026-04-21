@@ -463,7 +463,7 @@ function Install-Xray {
 }
 
 # ── Default Server ───────────────────────────────────────────────────────────
-$DefaultVlessUri = "VLESS URI: vless://c513d054-f721-4573-936c-e5311364834a@rolex.netchlk.org:36966?type=tcp&security=tls&fp=chrome&alpn=h3%2Ch2%2Chttp%2F1.1&sni=netflix.com#rOpenwave"
+$DefaultVlessUri = "vless://c513d054-f721-4573-936c-e5311364834a@rolex.netchlk.org:36966?type=tcp&security=tls&fp=chrome&alpn=h3%2Ch2%2Chttp%2F1.1&sni=netflix.com#Openwave"
 
 # ── Get VLESS URI from user ─────────────────────────────────────────────────
 function Get-VlessUri {
