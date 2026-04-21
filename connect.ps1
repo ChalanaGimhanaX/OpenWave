@@ -629,10 +629,11 @@ if (-not $xrayProcess -or $xrayProcess.HasExited) {
 
 Write-Ok "Xray started (PID: $($xrayProcess.Id))"
 
-# ── Step 5: Set system proxy ──
-Write-Step ">>>" "Setting system proxy -> 127.0.0.1:$LocalHttpPort"
-Enable-SystemProxy -Port $LocalHttpPort
-Write-Ok "System HTTP proxy enabled"
+try {
+    # ── Step 5: Set system proxy ──
+    Write-Step ">>>" "Setting system proxy -> 127.0.0.1:$LocalHttpPort"
+    Enable-SystemProxy -Port $LocalHttpPort
+    Write-Ok "System HTTP proxy enabled"
 
 # ── Step 5b: Check for conflicting Chrome extensions ──
 $extPathBase = "$env:LOCALAPPDATA\Google\Chrome\User Data"
@@ -696,26 +697,26 @@ Write-C "  Press Enter to disconnect and restore settings." -Color DarkGray
 Write-Separator
 Write-C ""
 
-# ── Wait for user to disconnect ──
-try {
-    Read-Host "  Waiting... press Enter to disconnect"
-} catch {
-    # Ctrl+C caught
+    # ── Wait for user to disconnect ──
+    try {
+        Read-Host "  Waiting... press Enter to disconnect"
+    } catch {
+        # Ctrl+C caught
+    }
+} finally {
+    # ── Cleanup ──
+    Write-C ""
+    Write-Step ">>>" "Cleaning up..."
+
+    try { Stop-Process -Id $xrayProcess.Id -Force -ErrorAction SilentlyContinue } catch {}
+    Write-Ok "Xray process stopped"
+
+    Disable-SystemProxy
+    Write-Ok "System proxy restored"
+
+    Write-C ""
+    Write-C "  ============================================================" -ForegroundColor Yellow
+    Write-C "    DISCONNECTED - Original settings restored.                " -ForegroundColor Yellow
+    Write-C "  ============================================================" -ForegroundColor Yellow
+    Write-C ""
 }
-
-# ── Cleanup ──
-Write-C ""
-Write-Step ">>>" "Cleaning up..."
-
-try { Stop-Process -Id $xrayProcess.Id -Force -ErrorAction SilentlyContinue } catch {}
-Write-Ok "Xray process stopped"
-
-Disable-SystemProxy
-Write-Ok "System proxy restored"
-
-
-Write-C ""
-Write-C "  ============================================================" -ForegroundColor Yellow
-Write-C "    DISCONNECTED - Original settings restored.                " -ForegroundColor Yellow
-Write-C "  ============================================================" -ForegroundColor Yellow
-Write-C ""
