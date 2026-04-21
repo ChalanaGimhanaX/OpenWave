@@ -663,17 +663,18 @@ try {
     Enable-SystemProxy -Port $LocalHttpPort
     Write-Ok "System HTTP proxy enabled"
 
-    # ── Step 5b: Start background watchdog (fully detached via WMI) ──
-    # IMPORTANT: Must use WMI Win32_Process.Create() instead of Start-Process.
-    # Start-Process makes the watchdog a CHILD of this terminal, so "End Task"
-    # in Task Manager kills the entire process tree (terminal + watchdog + xray)
-    # before cleanup can run. WMI spawns it under the WMI service — a completely
-    # separate tree — so it survives terminal termination and can clean up properly.
+    # ── Step 5b: Start background watchdog (Fully Detached via cmd) ──
     $xrayPid = $xrayProcess.Id
+    $xrayDirForWD = $XrayDir
+    $confDirForWD = $ConfigPath
+    $logDirForWD  = "$InstallDir\xray-log.txt"
+    $errDirForWD  = "$InstallDir\xray-err.txt"
+    $wdPidFile    = "$InstallDir\wd.pid"
+    $zipDirForWD  = "$InstallDir\xray.zip"
+
     $watchdogScript = @"
-# Wait until the parent PowerShell session (PID $PID) is gone
+`$PID | Out-File -FilePath `"$wdPidFile`"
 while (Get-Process -Id $PID -ErrorAction SilentlyContinue) { Start-Sleep -Seconds 2 }
-# Parent is gone — kill xray and restore proxy
 Stop-Process -Id $xrayPid -Force -ErrorAction SilentlyContinue
 Stop-Process -Name xray -Force -ErrorAction SilentlyContinue
 `$regPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
@@ -683,21 +684,19 @@ Remove-ItemProperty -Path `$regPath -Name ProxyOverride -ErrorAction SilentlyCon
 `$sig = '[DllImport("wininet.dll")] public static extern bool InternetSetOption(IntPtr h, int d, IntPtr b, int l);'
 `$win = Add-Type -MemberDefinition `$sig -Name WD -Namespace OW -PassThru -ErrorAction SilentlyContinue
 if (`$win) { `$win::InternetSetOption(0, 39, 0, 0) | Out-Null; `$win::InternetSetOption(0, 37, 0, 0) | Out-Null }
+if (Test-Path `"$xrayDirForWD`") { Remove-Item -Recurse -Force `"$xrayDirForWD`" -ErrorAction SilentlyContinue }
+if (Test-Path `"$confDirForWD`") { Remove-Item -Force `"$confDirForWD`" -ErrorAction SilentlyContinue }
+if (Test-Path `"$logDirForWD`")  { Remove-Item -Force `"$logDirForWD`" -ErrorAction SilentlyContinue }
+if (Test-Path `"$errDirForWD`")  { Remove-Item -Force `"$errDirForWD`" -ErrorAction SilentlyContinue }
+if (Test-Path `"$zipDirForWD`")  { Remove-Item -Force `"$zipDirForWD`" -ErrorAction SilentlyContinue }
+if (Test-Path `"$wdPidFile`")    { Remove-Item -Force `"$wdPidFile`" -ErrorAction SilentlyContinue }
 "@
     $encodedWatchdog = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($watchdogScript))
-    $wmiCmd = "powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -NoProfile -EncodedCommand $encodedWatchdog"
-
-    # Spawn via WMI — process is owned by WMI service, NOT this terminal
-    $wmiResult = ([wmiclass]"Win32_Process").Create($wmiCmd)
-    if ($wmiResult.ReturnValue -eq 0) {
-        $script:WatchdogPid = $wmiResult.ProcessId
-        Write-Ok "Watchdog started via WMI (PID: $($script:WatchdogPid)) — survives Task Manager kills"
-    } else {
-        # Fallback: if WMI fails (e.g. permissions), use Start-Process
-        $fallback = Start-Process powershell.exe -ArgumentList "-WindowStyle Hidden -ExecutionPolicy Bypass -NoProfile -EncodedCommand $encodedWatchdog" -PassThru
-        $script:WatchdogPid = if ($fallback) { $fallback.Id } else { $null }
-        Write-Ok "Watchdog started (fallback mode, PID: $($script:WatchdogPid))"
-    }
+    
+    # 'cmd /c start' acts as a breakaway trigger. The cmd exits immediately and PowerShell detaches to root!
+    $detachedCmd = "/c start `"`" /MIN powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -NoProfile -EncodedCommand $encodedWatchdog"
+    Start-Process cmd.exe -ArgumentList $detachedCmd -WindowStyle Hidden
+    Write-Ok "Watchdog started (Fully detached process, immune to Task Manager)"
 
 # ── Step 5b: Check for conflicting Chrome extensions ──
 $extPathBase = "$env:LOCALAPPDATA\Google\Chrome\User Data"
@@ -772,9 +771,12 @@ Write-C ""
     Write-C ""
     Write-Step ">>>" "Cleaning up..."
 
-    # Kill the watchdog — cleanup is being handled below, watchdog no longer needed
-    if ($script:WatchdogPid) {
-        try { Stop-Process -Id $script:WatchdogPid -Force -ErrorAction SilentlyContinue } catch {}
+    # Kill the watchdog cleanly via PID file to prevent redundant background cleanup
+    $wdPidFile = "$InstallDir\wd.pid"
+    if (Test-Path $wdPidFile) {
+        $wdPid = Get-Content $wdPidFile -ErrorAction SilentlyContinue
+        if ($wdPid) { try { Stop-Process -Id $wdPid -Force -ErrorAction SilentlyContinue } catch {} }
+        Remove-Item -Force $wdPidFile -ErrorAction SilentlyContinue
     }
 
     try { Stop-Process -Id $xrayProcess.Id -Force -ErrorAction SilentlyContinue } catch {}
@@ -782,6 +784,14 @@ Write-C ""
 
     Disable-SystemProxy
     Write-Ok "System proxy restored"
+
+    Write-Step ">>>" "Removing downloaded files & logs..."
+    if (Test-Path $XrayDir) { Remove-Item -Recurse -Force $XrayDir -ErrorAction SilentlyContinue }
+    if (Test-Path "$InstallDir\xray.zip") { Remove-Item -Force "$InstallDir\xray.zip" -ErrorAction SilentlyContinue }
+    if (Test-Path $ConfigPath) { Remove-Item -Force $ConfigPath -ErrorAction SilentlyContinue }
+    if (Test-Path "$InstallDir\xray-log.txt") { Remove-Item -Force "$InstallDir\xray-log.txt" -ErrorAction SilentlyContinue }
+    if (Test-Path "$InstallDir\xray-err.txt") { Remove-Item -Force "$InstallDir\xray-err.txt" -ErrorAction SilentlyContinue }
+    Write-Ok "Cleanup complete."
 
     Write-C ""
     Write-C "  ============================================================" -ForegroundColor Yellow
