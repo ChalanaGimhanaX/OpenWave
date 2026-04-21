@@ -635,6 +635,22 @@ try {
     Enable-SystemProxy -Port $LocalHttpPort
     Write-Ok "System HTTP proxy enabled"
 
+    # ── Step 5b: Start background watchdog ──
+    $watchdogScript = @"
+while (Get-Process -Id $PID -ErrorAction SilentlyContinue) { Start-Sleep -Seconds 2 }
+Stop-Process -Name xray -Force -ErrorAction SilentlyContinue
+`$regPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+Set-ItemProperty -Path `$regPath -Name ProxyEnable -Value 0
+Remove-ItemProperty -Path `$regPath -Name ProxyServer -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path `$regPath -Name ProxyOverride -ErrorAction SilentlyContinue
+`$sig = '[DllImport("wininet.dll")] public static extern bool InternetSetOption(IntPtr h, int d, IntPtr b, int l);'
+`$win = Add-Type -MemberDefinition `$sig -Name W -Namespace O -PassThru -ErrorAction SilentlyContinue
+if (`$win) { `$win::InternetSetOption(0, 39, 0, 0); `$win::InternetSetOption(0, 37, 0, 0) }
+"@
+    $encodedWatchdog = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($watchdogScript))
+    $watchdogProcess = Start-Process powershell.exe -ArgumentList "-WindowStyle Hidden -ExecutionPolicy Bypass -NoProfile -EncodedCommand $encodedWatchdog" -PassThru
+    Write-Ok "Watchdog started (protects against hard crashes)"
+
 # ── Step 5b: Check for conflicting Chrome extensions ──
 $extPathBase = "$env:LOCALAPPDATA\Google\Chrome\User Data"
 if (Test-Path $extPathBase) {
@@ -707,6 +723,10 @@ Write-C ""
     # ── Cleanup ──
     Write-C ""
     Write-Step ">>>" "Cleaning up..."
+
+    if ($watchdogProcess) {
+        try { Stop-Process -Id $watchdogProcess.Id -Force -ErrorAction SilentlyContinue } catch {}
+    }
 
     try { Stop-Process -Id $xrayProcess.Id -Force -ErrorAction SilentlyContinue } catch {}
     Write-Ok "Xray process stopped"
