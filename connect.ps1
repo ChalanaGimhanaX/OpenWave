@@ -70,38 +70,64 @@ function Get-ParamOrDefault {
     return $Default
 }
 
-# ── VLESS URI Parser ────────────────────────────────────────────────────────
-# Format: vless://uuid@host:port?type=tcp&security=tls&sni=example.com&fp=chrome&encryption=none#Name
-function Parse-VlessUri {
+# ── Proxy URI Parser ────────────────────────────────────────────────────────
+# Supports VLESS, VMESS, TROJAN
+function Parse-ProxyUri {
     param([string]$Uri)
 
-    if (-not $Uri.StartsWith("vless://")) {
-        Write-Err "Invalid VLESS URI - must start with 'vless://'"
+    if ($Uri.StartsWith("vmess://")) {
+        $base64 = $Uri.Substring(8)
+        $pad = $base64.Length % 4
+        if ($pad -ne 0) { $base64 += "=" * (4 - $pad) }
+        try {
+            $json = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($base64))
+            $v = $json | ConvertFrom-Json
+            
+            return @{
+                Protocol    = "vmess"
+                Remark      = if ($v.ps) { $v.ps } else { "OpenWave VMESS" }
+                Address     = $v.add
+                Port        = [int]$v.port
+                UUID        = $v.id
+                AlterId     = if ($null -ne $v.aid) { [int]$v.aid } else { 0 }
+                Type        = if ($v.net) { $v.net } else { "tcp" }
+                Security    = if ($v.tls -eq "tls" -or $v.tls -eq "reality") { $v.tls } else { "none" }
+                SNI         = if ($v.sni) { $v.sni } elseif ($v.host) { $v.host } else { $v.add }
+                Host        = if ($v.host) { $v.host } else { "" }
+                Path        = if ($v.path) { $v.path } else { "/" }
+                ALPN        = if ($v.alpn) { $v.alpn } else { "" }
+                Fingerprint = if ($v.fp) { $v.fp } else { "chrome" }
+                ServiceName = ""
+            }
+        } catch {
+            Write-Err "Failed to parse VMESS URI"
+            return $null
+        }
+    }
+
+    $protocol = ""
+    $stripped = ""
+    if ($Uri.StartsWith("vless://")) { $protocol = "vless"; $stripped = $Uri.Substring(8) }
+    elseif ($Uri.StartsWith("trojan://")) { $protocol = "trojan"; $stripped = $Uri.Substring(9) }
+    else {
+        Write-Err "Unsupported URI scheme. Supported: vless, vmess, trojan."
         return $null
     }
 
-    $stripped = $Uri.Substring(8)
-
-    # Split off the fragment (#Name)
     $hashIdx = $stripped.LastIndexOf('#')
     if ($hashIdx -ge 0) {
         $main   = $stripped.Substring(0, $hashIdx)
         $remark = [System.Uri]::UnescapeDataString($stripped.Substring($hashIdx + 1))
     } else {
         $main   = $stripped
-        $remark = "OpenWave Server"
+        $remark = "OpenWave $protocol"
     }
 
-    # Split UUID from rest
     $atIdx = $main.IndexOf('@')
-    if ($atIdx -lt 0) {
-        Write-Err "Cannot parse UUID from VLESS URI"
-        return $null
-    }
-    $uuid = $main.Substring(0, $atIdx)
+    if ($atIdx -lt 0) { return $null }
+    $credentials = $main.Substring(0, $atIdx)
     $rest = $main.Substring($atIdx + 1)
 
-    # Split host:port from query
     $qIdx = $rest.IndexOf('?')
     if ($qIdx -ge 0) {
         $hostPort = $rest.Substring(0, $qIdx)
@@ -110,61 +136,51 @@ function Parse-VlessUri {
         $hostPort = $rest
         $queryStr = ""
     }
-    # Strip trailing slash (some clients add /path before ?)
     $hostPort = $hostPort.TrimEnd('/')
 
-    # Parse host and port (handle IPv6)
-    $addr = $null
-    $port = 443
+    $addr = $null; $port = 443
     if ($hostPort -match '^\[(.+)\]:(\d+)$') {
-        $addr = $Matches[1]
-        $port = [int]$Matches[2]
+        $addr = $Matches[1]; $port = [int]$Matches[2]
     } elseif ($hostPort -match '^(.+):(\d+)$') {
-        $addr = $Matches[1]
-        $port = [int]$Matches[2]
+        $addr = $Matches[1]; $port = [int]$Matches[2]
     } else {
-        Write-Err "Cannot parse host:port from VLESS URI"
         return $null
     }
 
-    # Parse query parameters
     $params = @{}
     if ($queryStr -ne "") {
-        $pairs = $queryStr.Split('&')
-        foreach ($pair in $pairs) {
+        foreach ($pair in $queryStr.Split('&')) {
             $eqIdx = $pair.IndexOf('=')
             if ($eqIdx -gt 0) {
-                $k = $pair.Substring(0, $eqIdx)
-                # Replace + with space (form-encoded), then URL-decode
                 $rawVal = $pair.Substring($eqIdx + 1).Replace('+', ' ')
-                $v = [System.Uri]::UnescapeDataString($rawVal)
-                $params[$k] = $v
+                $params[$pair.Substring(0, $eqIdx)] = [System.Uri]::UnescapeDataString($rawVal)
             }
         }
     }
 
-    $result = @{
-        UUID        = $uuid
+    return @{
+        Protocol    = $protocol
+        UUID        = if ($protocol -eq "vless") { $credentials } else { "" }
+        Password    = if ($protocol -eq "trojan") { $credentials } else { "" }
+        Remark      = $remark
         Address     = $addr
         Port        = $port
-        Remark      = $remark
-        Type        = (Get-ParamOrDefault $params 'type'        'tcp')
-        Security    = (Get-ParamOrDefault $params 'security'    'none')
-        SNI         = (Get-ParamOrDefault $params 'sni'         $addr)
-        ALPN        = (Get-ParamOrDefault $params 'alpn'        '')
-        Path        = (Get-ParamOrDefault $params 'path'        '/')
-        Host        = (Get-ParamOrDefault $params 'host'        $addr)
-        Fingerprint = (Get-ParamOrDefault $params 'fp'          'chrome')
-        PbkKey      = (Get-ParamOrDefault $params 'pbk'         '')
-        Sid         = (Get-ParamOrDefault $params 'sid'         '')
-        Flow        = (Get-ParamOrDefault $params 'flow'        '')
-        HeaderType  = (Get-ParamOrDefault $params 'headerType'  'none')
-        Encryption  = (Get-ParamOrDefault $params 'encryption'  'none')
-        SpiderX     = (Get-ParamOrDefault $params 'spx'         '')
+        Type        = (Get-ParamOrDefault $params 'type' 'tcp')
+        Security    = (Get-ParamOrDefault $params 'security' 'none')
+        SNI         = (Get-ParamOrDefault $params 'sni' $addr)
+        ALPN        = (Get-ParamOrDefault $params 'alpn' '')
+        Path        = (Get-ParamOrDefault $params 'path' '/')
+        Host        = (Get-ParamOrDefault $params 'host' $addr)
+        Fingerprint = (Get-ParamOrDefault $params 'fp' 'chrome')
+        PbkKey      = (Get-ParamOrDefault $params 'pbk' '')
+        Sid         = (Get-ParamOrDefault $params 'sid' '')
+        Flow        = (Get-ParamOrDefault $params 'flow' '')
+        HeaderType  = (Get-ParamOrDefault $params 'headerType' 'none')
+        Encryption  = (Get-ParamOrDefault $params 'encryption' 'none')
+        SpiderX     = (Get-ParamOrDefault $params 'spx' '')
         ServiceName = (Get-ParamOrDefault $params 'serviceName' '')
-        Mode        = (Get-ParamOrDefault $params 'mode'        'gun')
+        Mode        = (Get-ParamOrDefault $params 'mode' 'gun')
     }
-    return $result
 }
 
 # ── Config Generator ────────────────────────────────────────────────────────
@@ -254,14 +270,35 @@ function Generate-XrayConfig {
         }
     }
 
-    # ── VLESS user ──
-    $vlessUser = @{
-        id         = $Server.UUID
-        encryption = $Server.Encryption
-        level      = 0
-    }
-    if ($Server.Flow -ne "" -and $Server.Flow -ne "none") {
-        $vlessUser["flow"] = $Server.Flow
+    # ── Protocol-specific Outbound Settings ──
+    $outboundSettings = @{}
+    if ($Server.Protocol -eq "vless") {
+        $vlessUser = @{
+            id         = $Server.UUID
+            encryption = if ($Server.Encryption) { $Server.Encryption } else { "none" }
+            level      = 0
+        }
+        if ($Server.Flow -ne "" -and $Server.Flow -ne "none") { $vlessUser["flow"] = $Server.Flow }
+        $outboundSettings = @{
+            vnext = @( @{ address = $Server.Address; port = $Server.Port; users = @($vlessUser) } )
+        }
+    } elseif ($Server.Protocol -eq "vmess") {
+        $outboundSettings = @{
+            vnext = @( @{
+                address = $Server.Address
+                port    = $Server.Port
+                users   = @( @{ id = $Server.UUID; alterId = $Server.AlterId; security = "auto"; level = 0 } )
+            })
+        }
+    } elseif ($Server.Protocol -eq "trojan") {
+        $outboundSettings = @{
+            servers = @( @{
+                address  = $Server.Address
+                port     = $Server.Port
+                password = $Server.Password
+                level    = 0
+            })
+        }
     }
 
     # ── Full config ──
@@ -309,16 +346,8 @@ function Generate-XrayConfig {
         outbounds = @(
             @{
                 tag      = "proxy"
-                protocol = "vless"
-                settings = @{
-                    vnext = @(
-                        @{
-                            address = $Server.Address
-                            port    = $Server.Port
-                            users   = @($vlessUser)
-                        }
-                    )
-                }
+                protocol = $Server.Protocol
+                settings = $outboundSettings
                 streamSettings = $streamSettings
             },
             @{
@@ -403,9 +432,8 @@ function Install-Xray {
 
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        $ProgressPreference = 'SilentlyContinue'
+        # Progress Preference intentionally left to default to show download loading bar
         Invoke-WebRequest -Uri $XrayZipUrl -OutFile $zipPath -UseBasicParsing
-        $ProgressPreference = 'Continue'
     } catch {
         Write-Err "Failed to download Xray: $_"
         Write-C ""
@@ -447,7 +475,7 @@ function Get-VlessUri {
     $savedFile = "$InstallDir\servers.txt"
     $savedUris = @()
     if (Test-Path $savedFile) {
-        $savedUris = @(Get-Content $savedFile | Where-Object { $_ -match '^vless://' })
+        $savedUris = @(Get-Content $savedFile | Where-Object { $_ -match '^(vless|vmess|trojan)://' })
     }
 
     Write-C ""
@@ -460,7 +488,7 @@ function Get-VlessUri {
     $menuIndex = 0
 
     # Show default server
-    $defaultParsed = Parse-VlessUri $DefaultVlessUri
+    $defaultParsed = Parse-ProxyUri $DefaultVlessUri
     if ($defaultParsed) {
         Write-C "  Default server:" -Color Green
         Write-C "    [D] $($defaultParsed.Remark) ($($defaultParsed.Address):$($defaultParsed.Port))" -Color White
@@ -470,7 +498,7 @@ function Get-VlessUri {
     if ($savedUris.Count -gt 0) {
         Write-C "  Saved servers:" -Color Yellow
         for ($i = 0; $i -lt $savedUris.Count; $i++) {
-            $parsed = Parse-VlessUri $savedUris[$i]
+            $parsed = Parse-ProxyUri $savedUris[$i]
             if ($parsed) {
                 $label = "$($parsed.Remark) ($($parsed.Address):$($parsed.Port))"
             } else {
@@ -504,7 +532,7 @@ function Get-VlessUri {
     # New server
     Write-C ""
     Write-C "  Paste your VLESS URI below." -Color Yellow
-    Write-C "  Format: vless://uuid@host:port?params#Name" -Color DarkGray
+    Write-C "  Format: vless://, vmess://, trojan:// URI" -Color DarkGray
     Write-C ""
     $uri = Read-Host "  VLESS URI"
 
@@ -585,7 +613,7 @@ if (-not (Install-Xray)) {
 $uri = Get-VlessUri
 if (-not $uri) { exit 1 }
 
-$server = Parse-VlessUri $uri
+$server = Parse-ProxyUri $uri
 if (-not $server) {
     Write-Err "Failed to parse VLESS URI. Check the format and try again."
     Read-Host "  Press Enter to exit"

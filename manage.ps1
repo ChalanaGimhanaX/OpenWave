@@ -19,59 +19,34 @@ $Banner = @"
 
 "@
 
-function Parse-VlessUri {
+function Parse-ProxyUri {
     param([string]$Uri)
-    if (-not $Uri.StartsWith("vless://")) { return $null }
-    $stripped = $Uri.Substring(8)
-
-    $hashIdx = $stripped.LastIndexOf('#')
-    if ($hashIdx -ge 0) {
-        $main   = $stripped.Substring(0, $hashIdx)
-        $remark = [System.Uri]::UnescapeDataString($stripped.Substring($hashIdx + 1))
-    } else {
-        $main   = $stripped
-        $remark = "Unnamed"
+    if ($Uri.StartsWith("vmess://")) {
+        $b64 = $Uri.Substring(8); $p = $b64.Length % 4
+        if ($p -ne 0) { $b64 += "=" * (4 - $p) }
+        try {
+            $v = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64)) | ConvertFrom-Json
+            return @{ Protocol="vmess"; Remark=if($v.ps){$v.ps}else{"VMESS"}; Address=$v.add; Port=$v.port; Security=if($v.tls){$v.tls}else{"none"}; Type=if($v.net){$v.net}else{"tcp"} }
+        } catch { return $null }
     }
-
-    $atIdx = $main.IndexOf('@')
-    if ($atIdx -lt 0) { return $null }
-    $rest = $main.Substring($atIdx + 1)
-
-    $qIdx = $rest.IndexOf('?')
-    if ($qIdx -ge 0) {
-        $hostPort = $rest.Substring(0, $qIdx)
-        $queryStr = $rest.Substring($qIdx + 1)
-    } else {
-        $hostPort = $rest
-        $queryStr = ""
-    }
-    $hostPort = $hostPort.TrimEnd('/')
-
-    $addr = $null
-    $port = "443"
-    if ($hostPort -match '^(.+):(\d+)$') {
-        $addr = $Matches[1]
-        $port = $Matches[2]
-    } else {
-        return $null
-    }
-
-    $sec  = "none"
-    $typ  = "tcp"
-    if ($queryStr -ne "") {
-        $pairs = $queryStr.Split('&')
-        foreach ($pair in $pairs) {
-            $eqIdx = $pair.IndexOf('=')
-            if ($eqIdx -gt 0) {
-                $k = $pair.Substring(0, $eqIdx)
-                $v = $pair.Substring($eqIdx + 1)
-                if ($k -eq 'security') { $sec = $v }
-                if ($k -eq 'type')     { $typ = $v }
-            }
+    
+    $prot = if ($Uri.StartsWith("vless://")) { "vless" } elseif ($Uri.StartsWith("trojan://")) { "trojan" } else { return $null }
+    $s = $Uri.Substring($prot.Length + 3)
+    $h = $s.LastIndexOf('#'); $rmk = if ($h -ge 0) { [Uri]::UnescapeDataString($s.Substring($h + 1)) } else { "Unnamed" }
+    $m = if ($h -ge 0) { $s.Substring(0, $h) } else { $s }
+    $at = $m.IndexOf('@'); if ($at -lt 0) { return $null }
+    $r = $m.Substring($at + 1)
+    $q = $r.IndexOf('?'); $hp = if ($q -ge 0) { $r.Substring(0, $q) } else { $r }; $qs = if ($q -ge 0) { $r.Substring($q + 1) } else { "" }
+    $hp = $hp.TrimEnd('/')
+    if ($hp -match '^\[(.+)\]:(\d+)$' -or $hp -match '^(.+):(\d+)$') { $ad = $Matches[1]; $pt = $Matches[2] } else { return $null }
+    $sec="none"; $typ="tcp"
+    if ($qs -ne "") {
+        foreach ($pair in $qs.Split('&')) {
+            $e = $pair.IndexOf('=')
+            if ($e -gt 0) { $k=$pair.Substring(0,$e); $v=$pair.Substring($e+1); if($k -eq 'security'){$sec=$v}; if($k -eq 'type'){$typ=$v} }
         }
     }
-
-    return @{ Remark=$remark; Address=$addr; Port=$port; Security=$sec; Type=$typ }
+    return @{ Protocol=$prot; Remark=$rmk; Address=$ad; Port=$pt; Security=$sec; Type=$typ }
 }
 
 function Show-Servers {
@@ -79,7 +54,7 @@ function Show-Servers {
         Write-C "  No servers saved yet." -C Yellow
         return @()
     }
-    $uris = @(Get-Content $SavedFile | Where-Object { $_ -match '^vless://' })
+        $uris = @(Get-Content $SavedFile | Where-Object { $_ -match '^(vless|vmess|trojan)://' })
     if ($uris.Count -eq 0) {
         Write-C "  No servers saved yet." -C Yellow
         return @()
@@ -89,7 +64,7 @@ function Show-Servers {
     Write-C "  |  #   | Name                      | Address           | Sec  |" -C DarkCyan
     Write-C "  +------+---------------------------+-------------------+------+" -C DarkCyan
     for ($i = 0; $i -lt $uris.Count; $i++) {
-        $s = Parse-VlessUri $uris[$i]
+        $s = Parse-ProxyUri $uris[$i]
         if ($s) {
             $name  = $s.Remark.PadRight(25).Substring(0,25)
             $adr   = ("$($s.Address):$($s.Port)").PadRight(17).Substring(0,17)
@@ -104,13 +79,13 @@ function Show-Servers {
 
 function Add-Server {
     Write-C ""
-    Write-C "  Paste your VLESS URI:" -C Yellow
+    Write-C "  Paste your Proxy URI (vless/vmess/trojan):" -C Yellow
     $uri = Read-Host "  "
-    if (-not $uri.StartsWith("vless://")) {
-        Write-C "  [!!] Invalid VLESS URI" -C Red
+    if (-not ($uri.StartsWith("vless://") -or $uri.StartsWith("vmess://") -or $uri.StartsWith("trojan://"))) {
+        Write-C "  [!!] Invalid Proxy URI" -C Red
         return
     }
-    $s = Parse-VlessUri $uri
+    $s = Parse-ProxyUri $uri
     if (-not $s) {
         Write-C "  [!!] Failed to parse URI" -C Red
         return
