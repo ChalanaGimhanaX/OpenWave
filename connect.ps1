@@ -663,21 +663,41 @@ try {
     Enable-SystemProxy -Port $LocalHttpPort
     Write-Ok "System HTTP proxy enabled"
 
-    # ── Step 5b: Start background watchdog ──
+    # ── Step 5b: Start background watchdog (fully detached via WMI) ──
+    # IMPORTANT: Must use WMI Win32_Process.Create() instead of Start-Process.
+    # Start-Process makes the watchdog a CHILD of this terminal, so "End Task"
+    # in Task Manager kills the entire process tree (terminal + watchdog + xray)
+    # before cleanup can run. WMI spawns it under the WMI service — a completely
+    # separate tree — so it survives terminal termination and can clean up properly.
+    $xrayPid = $xrayProcess.Id
     $watchdogScript = @"
+# Wait until the parent PowerShell session (PID $PID) is gone
 while (Get-Process -Id $PID -ErrorAction SilentlyContinue) { Start-Sleep -Seconds 2 }
+# Parent is gone — kill xray and restore proxy
+Stop-Process -Id $xrayPid -Force -ErrorAction SilentlyContinue
 Stop-Process -Name xray -Force -ErrorAction SilentlyContinue
 `$regPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
 Set-ItemProperty -Path `$regPath -Name ProxyEnable -Value 0
-Remove-ItemProperty -Path `$regPath -Name ProxyServer -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path `$regPath -Name ProxyServer   -ErrorAction SilentlyContinue
 Remove-ItemProperty -Path `$regPath -Name ProxyOverride -ErrorAction SilentlyContinue
 `$sig = '[DllImport("wininet.dll")] public static extern bool InternetSetOption(IntPtr h, int d, IntPtr b, int l);'
-`$win = Add-Type -MemberDefinition `$sig -Name W -Namespace O -PassThru -ErrorAction SilentlyContinue
-if (`$win) { `$win::InternetSetOption(0, 39, 0, 0); `$win::InternetSetOption(0, 37, 0, 0) }
+`$win = Add-Type -MemberDefinition `$sig -Name WD -Namespace OW -PassThru -ErrorAction SilentlyContinue
+if (`$win) { `$win::InternetSetOption(0, 39, 0, 0) | Out-Null; `$win::InternetSetOption(0, 37, 0, 0) | Out-Null }
 "@
     $encodedWatchdog = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($watchdogScript))
-    $watchdogProcess = Start-Process powershell.exe -ArgumentList "-WindowStyle Hidden -ExecutionPolicy Bypass -NoProfile -EncodedCommand $encodedWatchdog" -PassThru
-    Write-Ok "Watchdog started (protects against hard crashes)"
+    $wmiCmd = "powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -NoProfile -EncodedCommand $encodedWatchdog"
+
+    # Spawn via WMI — process is owned by WMI service, NOT this terminal
+    $wmiResult = ([wmiclass]"Win32_Process").Create($wmiCmd)
+    if ($wmiResult.ReturnValue -eq 0) {
+        $script:WatchdogPid = $wmiResult.ProcessId
+        Write-Ok "Watchdog started via WMI (PID: $($script:WatchdogPid)) — survives Task Manager kills"
+    } else {
+        # Fallback: if WMI fails (e.g. permissions), use Start-Process
+        $fallback = Start-Process powershell.exe -ArgumentList "-WindowStyle Hidden -ExecutionPolicy Bypass -NoProfile -EncodedCommand $encodedWatchdog" -PassThru
+        $script:WatchdogPid = if ($fallback) { $fallback.Id } else { $null }
+        Write-Ok "Watchdog started (fallback mode, PID: $($script:WatchdogPid))"
+    }
 
 # ── Step 5b: Check for conflicting Chrome extensions ──
 $extPathBase = "$env:LOCALAPPDATA\Google\Chrome\User Data"
@@ -752,8 +772,9 @@ Write-C ""
     Write-C ""
     Write-Step ">>>" "Cleaning up..."
 
-    if ($watchdogProcess) {
-        try { Stop-Process -Id $watchdogProcess.Id -Force -ErrorAction SilentlyContinue } catch {}
+    # Kill the watchdog — cleanup is being handled below, watchdog no longer needed
+    if ($script:WatchdogPid) {
+        try { Stop-Process -Id $script:WatchdogPid -Force -ErrorAction SilentlyContinue } catch {}
     }
 
     try { Stop-Process -Id $xrayProcess.Id -Force -ErrorAction SilentlyContinue } catch {}

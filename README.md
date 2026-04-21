@@ -1,73 +1,69 @@
 # OpenWave
 
-**One-command V2Ray tunnel for restricted university WiFi networks.**
+**One-command proxy tunnel for restricted university & workplace networks.**
 
-No third-party GUI software needed — just a single PowerShell command.
+No installs, no GUI, no technical knowledge required — just paste one line into PowerShell and you're connected.
 
 ---
 
 ## Quick Start
 
-### One-Liner (copy-paste into PowerShell)
+Open **PowerShell** and paste this:
 
 ```powershell
 irm https://raw.githubusercontent.com/ChalanaGimhanaX/OpenWave/main/connect.ps1 | iex
 ```
 
-### Local Run
+That's it. OpenWave will download everything it needs, set up the tunnel, and tell you when you're connected.
+
+> **Press Enter at any time to disconnect** and everything is restored automatically.
+
+---
+
+## What Happens When You Run It
+
+1. **Downloads Xray** — the tunnel engine is downloaded once and saved to `~/.openwave/`. Future runs are instant.
+2. **Picks a server** — choose from your saved servers or paste in a new one.
+3. **Starts the tunnel** — routes your traffic through the server.
+4. **Sets your system proxy** — all browsers and apps automatically use the tunnel.
+5. **Watches for crashes** — a background watchdog monitors the script. Even if you force-quit or Task Manager kills it, the watchdog cleans up your proxy settings so your internet is never left broken.
+6. **Disconnects cleanly** — press Enter and all settings are restored.
+
+---
+
+## Supported Server Types
+
+You can paste any of these link formats:
+
+| Protocol | Format |
+|----------|--------|
+| **VLESS** | `vless://uuid@host:port?...#Name` |
+| **VMESS** | `vmess://base64encodedstring` |
+| **Trojan** | `trojan://password@host:port?...#Name` |
+
+All transport types are supported: TCP, WebSocket, gRPC, HTTP/2, and all security modes (TLS, Reality, None).
+
+---
+
+## If Chrome Isn't Using the Tunnel
+
+Some Chrome extensions (like VPNs or privacy shields) control their own proxy settings and can override the system tunnel. OpenWave will automatically detect these and show you a list.
+
+**To fix it:**
+1. Click the **puzzle-piece icon** in the top-right corner of Chrome
+2. Turn **OFF** any VPN or proxy extensions shown in the list
+3. Turn them back **ON** when you're done
+
+---
+
+## Managing Your Servers
 
 ```powershell
-# Connect with interactive server selection (default server included)
-.\connect.ps1
-
-# Connect with a specific VLESS URI
-.\connect.ps1 -VlessUri "vless://uuid@host:port?type=ws&security=tls&sni=example.com#MyServer"
-
-# Manage saved servers
+# Open the server manager
 .\manage.ps1
 ```
 
----
-
-## What It Does
-
-1. **Downloads V2Ray Core** — Fetches `v2ray-core` binary from GitHub (only once, cached in `~/.openwave/`)
-2. **Parses your VLESS URI** — Supports all transport types (TCP, WebSocket, gRPC, H2) and security modes (TLS, Reality, None)
-3. **Generates config** — Creates a proper V2Ray JSON config with SOCKS5 + HTTP inbounds
-4. **Starts Local Proxy** — Runs V2Ray in the background
-5. **Sets System Proxy** — Automatically configures Windows HTTP proxy so all apps route through the tunnel
-6. **Cleans Up** — When you disconnect, it stops V2Ray and restores your original proxy settings
-
----
-
-## Supported VLESS Configurations
-
-| Feature | Support |
-|---------|---------|
-| **Transport** | TCP, WebSocket, gRPC, HTTP/2 |
-| **Security** | TLS, Reality, None |
-| **Fingerprint** | Chrome, Firefox, Safari, etc. |
-| **Flow** | xtls-rprx-vision |
-| **ALPN** | h2, http/1.1 |
-
-### VLESS URI Format
-
-```
-vless://UUID@ADDRESS:PORT?type=TRANSPORT&security=SECURITY&sni=SNI&fp=FINGERPRINT#REMARK
-```
-
-**Examples:**
-
-```
-# WebSocket + TLS
-vless://xxxx-xxxx@example.com:443?type=ws&security=tls&sni=example.com&path=%2Fws#MyServer
-
-# Reality
-vless://xxxx-xxxx@1.2.3.4:443?type=tcp&security=reality&sni=www.google.com&fp=chrome&pbk=XXXXX&sid=XXXX&flow=xtls-rprx-vision#RealityServer
-
-# gRPC + TLS
-vless://xxxx-xxxx@example.com:443?type=grpc&security=tls&sni=example.com&serviceName=mygrpc#gRPC-Server
-```
+From there you can add, remove, and list your saved servers, or connect directly.
 
 ---
 
@@ -75,12 +71,10 @@ vless://xxxx-xxxx@example.com:443?type=grpc&security=tls&sni=example.com&service
 
 ```
 ~/.openwave/
-├── v2ray/           # V2Ray core binary (auto-downloaded)
-│   ├── v2ray.exe
-│   ├── geoip.dat
-│   └── geosite.dat
-├── config.json      # Auto-generated V2Ray config
-└── servers.txt      # Saved VLESS server URIs
+├── xray/            # Xray engine (auto-downloaded)
+│   └── xray.exe
+├── config.json      # Auto-generated config
+└── servers.txt      # Your saved server links
 ```
 
 ---
@@ -88,9 +82,8 @@ vless://xxxx-xxxx@example.com:443?type=grpc&security=tls&sni=example.com&service
 ## Uninstall
 
 ```powershell
-# Via manager
-.\manage.ps1
-# Select option [5] Uninstall
+# Via the manager
+.\manage.ps1        # Select [5] Uninstall
 
 # Or manually
 Remove-Item -Recurse -Force "$env:USERPROFILE\.openwave"
@@ -100,7 +93,7 @@ Remove-Item -Recurse -Force "$env:USERPROFILE\.openwave"
 
 ## Notes
 
-- **Admin not required** — runs entirely in user space
-- **Proxy scope** — sets Windows system HTTP proxy, which covers browsers and most apps. Some apps (like terminal tools) may need manual SOCKS5 config at `127.0.0.1:10808`
-- **GitHub access** — initial download requires access to `github.com`. If blocked, manually place `v2ray.exe` in `~/.openwave/v2ray/`
-- **Default server included** — a built-in VLESS server is provided so you can connect without any configuration
+- **No admin required** — runs entirely as a regular user
+- **Crash-safe** — the WMI watchdog ensures your proxy is always restored even if the window is force-closed
+- **First run needs internet** — Xray is downloaded from GitHub. If GitHub is blocked, manually place `xray.exe` in `~/.openwave/xray/`
+- **Default server included** — works out of the box without any configuration
