@@ -227,8 +227,15 @@ function Generate-XrayConfig {
             }
             if ($Server.ALPN -ne "") {
                 $alpnValues = @()
-                foreach ($a in ($Server.ALPN -split ',')) { $alpnValues += $a.Trim() }
-                $tlsSettings["alpn"] = $alpnValues
+                foreach ($a in ($Server.ALPN -split ',')) {
+                    $trimmed = $a.Trim()
+                    # Filter out h3 (QUIC) when using TCP transport - incompatible
+                    if ($trimmed -eq "h3" -and $Server.Type -eq "tcp") { continue }
+                    if ($trimmed -ne "") { $alpnValues += $trimmed }
+                }
+                if ($alpnValues.Count -gt 0) {
+                    $tlsSettings["alpn"] = $alpnValues
+                }
             }
             $streamSettings["tlsSettings"] = $tlsSettings
         }
@@ -260,7 +267,7 @@ function Generate-XrayConfig {
     # ── Full config ──
     $config = @{
         log = @{
-            loglevel = "warning"
+            loglevel = "info"
         }
         dns = @{
             servers = @(
@@ -326,7 +333,7 @@ function Generate-XrayConfig {
             }
         )
         routing = @{
-            domainStrategy = "AsIs"
+            domainStrategy = "IPIfNonMatch"
             rules = @(
                 @{
                     type        = "field"
@@ -337,6 +344,11 @@ function Generate-XrayConfig {
                     type        = "field"
                     domain      = @("geosite:category-ads-all")
                     outboundTag = "block"
+                },
+                @{
+                    type        = "field"
+                    port        = "0-65535"
+                    outboundTag = "proxy"
                 }
             )
         }
@@ -511,7 +523,19 @@ function Get-VlessUri {
 
 # ── Test Connection ──────────────────────────────────────────────────────────
 function Test-ProxyConnection {
-    param([int]$Port, [int]$Retries = 5)
+    param([int]$Port, [int]$Retries = 6)
+
+    # First get our real IP (direct, no proxy)
+    $realIp = $null
+    try {
+        $wc = New-Object System.Net.WebClient
+        $wc.Proxy = [System.Net.GlobalProxySelection]::GetEmptyWebProxy()
+        $directResult = $wc.DownloadString("https://api.ipify.org")
+        $realIp = $directResult.Trim()
+        Write-Host "  [i] Your real IP: $realIp" -ForegroundColor DarkGray
+    } catch {
+        Write-Host "  [i] Could not determine real IP (network may be restricted)" -ForegroundColor DarkGray
+    }
 
     for ($i = 1; $i -le $Retries; $i++) {
         Start-Sleep -Seconds 2
@@ -519,7 +543,16 @@ function Test-ProxyConnection {
             $proxy = New-Object System.Net.WebProxy("http://127.0.0.1:$Port")
             $webClient = New-Object System.Net.WebClient
             $webClient.Proxy = $proxy
-            $result = $webClient.DownloadString("http://httpbin.org/ip")
+            $result = $webClient.DownloadString("https://api.ipify.org")
+            $proxyIp = $result.Trim()
+
+            if ($realIp -and $proxyIp -eq $realIp) {
+                Write-Host "  ... Attempt $i/$Retries - proxy IP same as real IP, tunnel may not be routing..." -ForegroundColor Yellow
+                continue
+            }
+
+            # Store proxy IP for display
+            $script:DetectedProxyIp = $proxyIp
             return $true
         } catch {
             Write-Host "  ... Attempt $i/$Retries - waiting for tunnel..." -ForegroundColor DarkGray
@@ -580,9 +613,12 @@ Write-Separator
 Write-C ""
 Write-Step ">>>" "Starting Xray tunnel..."
 
+$xrayLogFile = "$InstallDir\xray-log.txt"
 $xrayProcess = Start-Process -FilePath $XrayExe `
     -ArgumentList "run", "-config", $ConfigPath `
     -WindowStyle Hidden `
+    -RedirectStandardOutput $xrayLogFile `
+    -RedirectStandardError "$InstallDir\xray-err.txt" `
     -PassThru
 
 if (-not $xrayProcess -or $xrayProcess.HasExited) {
@@ -598,26 +634,60 @@ Write-Step ">>>" "Setting system proxy -> 127.0.0.1:$LocalHttpPort"
 Enable-SystemProxy -Port $LocalHttpPort
 Write-Ok "System HTTP proxy enabled"
 
+# ── Step 5b: Check for conflicting Chrome extensions ──
+$extPathBase = "$env:LOCALAPPDATA\Google\Chrome\User Data"
+if (Test-Path $extPathBase) {
+    $manifests = Get-ChildItem -Path "$extPathBase\*\Extensions\*\*\manifest.json" -ErrorAction SilentlyContinue
+    $blockingExts = @()
+    foreach ($mFile in $manifests) {
+        $manifest = Get-Content $mFile.FullName -Raw | ConvertFrom-Json -ErrorAction SilentlyContinue
+        if ($manifest -and $manifest.permissions -contains "proxy") {
+            $name = $manifest.name
+            if ($name -match "__MSG_") { $name = "A VPN/Proxy Extension ($($mFile.Directory.Parent.Name))" }
+            $blockingExts += $name
+        }
+    }
+    $blockingExts = $blockingExts | Select-Object -Unique
+    
+    if ($blockingExts.Count -gt 0) {
+        Write-C ""
+        Write-C "  [!!] ACTION REQUIRED: Conflicting Chrome Extensions [!!]" -ForegroundColor Red
+        Write-C "  The following extensions control your proxy and WILL block the tunnel:" -ForegroundColor Yellow
+        foreach ($ext in $blockingExts) {
+            Write-C "    - $ext" -ForegroundColor White
+        }
+        Write-C ""
+        Write-C "  To fix this:" -ForegroundColor Cyan
+        Write-C "  1. Open Chrome and go to: chrome://extensions" -ForegroundColor White
+        Write-C "  2. Turn OFF the extensions listed above" -ForegroundColor White
+        Write-C ""
+        Read-Host "  Press Enter once you have disabled them to continue"
+    }
+}
+
 # ── Step 6: Test connection ──
 Write-C ""
 Write-Step ">>>" "Testing connection..."
 $connected = Test-ProxyConnection -Port $LocalHttpPort
 
 if ($connected) {
+    $ipLine = if ($script:DetectedProxyIp) { "    Tunnel IP   -> $($script:DetectedProxyIp)" } else { "" }
     Write-C ""
     Write-C "  ============================================================" -ForegroundColor Green
     Write-C "                                                              " -ForegroundColor Green
     Write-C "    CONNECTED - You're bypassing restrictions now!            " -ForegroundColor Green
     Write-C "                                                              " -ForegroundColor Green
+    if ($ipLine) { Write-C "$ipLine" -ForegroundColor Green }
     Write-C "    HTTP Proxy  -> 127.0.0.1:$LocalHttpPort                          " -ForegroundColor Green
     Write-C "    SOCKS Proxy -> 127.0.0.1:$LocalSocksPort                          " -ForegroundColor Green
     Write-C "                                                              " -ForegroundColor Green
     Write-C "  ============================================================" -ForegroundColor Green
 } else {
     Write-C ""
-    Write-C "  WARNING: Tunnel started but connectivity check failed." -ForegroundColor Yellow
-    Write-C "  The server might still be initializing or the VLESS config" -ForegroundColor Yellow
-    Write-C "  may need adjustment. Proxy is set - try browsing manually." -ForegroundColor Yellow
+    Write-C "  WARNING: Tunnel started but the IP did not change." -ForegroundColor Yellow
+    Write-C "  The VLESS server may be misconfigured or unreachable." -ForegroundColor Yellow
+    Write-C "  Check Xray logs at: $InstallDir\xray-log.txt" -ForegroundColor Yellow
+    Write-C "  Proxy is set - you can try browsing manually." -ForegroundColor Yellow
 }
 
 Write-C ""
@@ -642,6 +712,7 @@ Write-Ok "Xray process stopped"
 
 Disable-SystemProxy
 Write-Ok "System proxy restored"
+
 
 Write-C ""
 Write-C "  ============================================================" -ForegroundColor Yellow
